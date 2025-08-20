@@ -1,0 +1,7 @@
+shb开头的文件中，将172.27.149.174修改为手机或其他边缘设备的地址
+shb_webrtc_client.py中的ENCODED_DIR修改为本地的地址
+安装环境：pip install opencv-python-headless
+pip install vidgear[core]
+pip install setuptools
+服务端还需安装：pip install colorlog
+pip install simplejpeg
