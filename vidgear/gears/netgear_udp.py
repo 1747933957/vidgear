@@ -40,6 +40,7 @@ PKT_DATA = 0      # client发送的普通数据（文件字节）
 PKT_RES  = 1      # YOLO 检测结果
 PKT_SV_DATA = 2   # server发送的普通数据（文件字节）
 PKT_TERM = 3      # 终止（可选）
+PKT_ACK_PACKET = 4  # 【新增】ACK 包类型：接收端用于回执，负载中携带“原发送时间戳”
 
 # =============== RTP/RTCP 工具 ===============
 def _now_unix() -> float:
@@ -124,7 +125,7 @@ class NetGearUDP:
       - receive_mode=True : 以“主动接收”为主（也能回 RR，并允许 send 回对端）
     仅支持 bytes/bytearray/memoryview。
     关键扩展：
-      * 支持 pkt_type（PKT_DATA/PKT_RES/PKT_TERM）
+      * 支持 pkt_type（PKT_DATA/PKT_RES/PKT_TERM/PKT_ACK_PACKET）
       * 支持显式 frame_id
       * recv() 返回 dict: {"pkt_type", "frame_id", "data"}
     """
@@ -151,6 +152,8 @@ class NetGearUDP:
         self._recv_buf_size = int(options.get("recv_buffer_size", 16 * 1024 * 1024))
         self._send_buf_size = int(options.get("send_buffer_size", 16 * 1024 * 1024))
         self._queue_maxlen = int(options.get("queue_maxlen", RECV_QUEUE_MAXLEN))
+        # 【新增】是否把“每个 UDP 分片（包）”也上抛给应用层（默认 False 保持兼容）
+        self._deliver_per_packet = bool(options.pop('deliver_per_packet', False))
 
         # RTP 基本参数
         self._ssrc = random.getrandbits(32)
@@ -162,11 +165,9 @@ class NetGearUDP:
         self._sent_packets = 0
         self._sent_octets = 0
 
-        # 接收统计
+        # 接收/重组
         self._recv_mode = bool(receive_mode)
         self._queue: deque = deque(maxlen=self._queue_maxlen)
-
-        # 重组缓存: key=(ssrc, frame_id) -> {'t0','total','chunks','count','pkt_type'}
         self._frames: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
         # 序号/抖动
@@ -183,15 +184,15 @@ class NetGearUDP:
         self._peer_addr: Optional[Tuple[str, int]] = None
         self._peer_ssrc: Optional[int] = None
 
-        # LSR/DLSR/RTT
+        # RTCP 相关（内部计算保留，但不对外暴露 rtt_ms）
         self._last_sr_mid32: int = 0
         self._last_sr_arrival_ntp32: int = 0
         self._rtt_ms: float = -1.0
 
         # 额外统计
         self._total_frames_received = 0
-        self._total_packets_received = 0
-        self._total_packets_lost = 0
+        self._total_packets_received = 0  # 【修改】定义为“收到 ACK 包的计数器”
+        self._total_packets_lost = 0      # 内部使用（重组过期计数），不再通过 get_stats 暴露
         self._last_stats_time = time.time()
 
         # 套接字
@@ -234,7 +235,8 @@ class NetGearUDP:
                 if not ready[0]:
                     continue
                 pkt, peer = self._sock.recvfrom(65535)
-                self._total_packets_received += 1
+                # 【修改】不再在此处把每个 udp 包计入 total_packets_received
+                # self._total_packets_received += 1
             except socket.error as e:
                 if getattr(e, "errno", None) in (socket.EAGAIN, socket.EWOULDBLOCK):
                     time.sleep(0.0001)
@@ -265,10 +267,10 @@ class NetGearUDP:
                 current_time = time.time()
                 self._last_stats_time = current_time
                 self._gc_stale_frames()
-                logger.info(f"[Stats] Frames received: {self._total_frames_received}, "
-                            f"Packets received: {self._total_packets_received}, "
-                            f"Queue size: {len(self._queue)}, "
-                            f"Frames in progress: {len(self._frames)}")
+                # logger.info(f"[Stats] Frames received: {self._total_frames_received}, "
+                #             f"ACKs received: {self._total_packets_received}, "  # 【修改】语义化日志
+                #             f"Queue size: {len(self._queue)}, "
+                #             f"Frames in progress: {len(self._frames)}")
 
     def _rtcp_sr_loop(self) -> None:
         while not self._terminate:
@@ -335,6 +337,36 @@ class NetGearUDP:
         if pkt_type == PKT_TERM:
             # 可按需处理终止信号
             return
+        
+        # 【新增】ACK 包逐包计数（按“分片”为粒度）
+        if pkt_type == PKT_ACK_PACKET:
+            self._queue.append({
+                "pkt_type": int(pkt_type),
+                "frame_id": int(frame_id),
+                "frag_idx": int(frag_idx),
+                "frag_cnt": int(total_frags),
+                "rtp_seq": int(seq),
+                "data": frag,
+                "is_fragment": True,
+            })
+            self._total_packets_received += 1
+            return
+        try:
+            if getattr(self, "_deliver_per_packet", False):
+                if len(self._queue) < self._queue_maxlen:
+                    self._queue.append({
+                        "pkt_type": int(pkt_type),
+                        "frame_id": int(frame_id),
+                        "frag_idx": int(frag_idx),
+                        "frag_cnt": int(total_frags),
+                        "rtp_seq": int(seq),
+                        "data": frag,
+                        "is_fragment": True,             # 关键标记
+                    })
+                return
+        except Exception:
+            pass
+
 
         # 重组
         key = (ssrc, frame_id)
@@ -354,13 +386,15 @@ class NetGearUDP:
                 data = b"".join(fr["chunks"][i] for i in range(total))
                 try:
                     if len(self._queue) < self._queue_maxlen:
-                        # 关键：把 pkt_type 和 frame_id 一起交给上层
                         self._queue.append({
                             "pkt_type": fr["pkt_type"],
                             "frame_id": int(frame_id),
                             "data": data,
                         })
                         self._total_frames_received += 1
+                        # 【新增】当且仅当收到 ACK 包时，累计“total_packets_received”
+                        if fr["pkt_type"] == PKT_ACK_PACKET:
+                            self._total_packets_received += 1
                 except Exception:
                     pass
                 self._frames.pop(key, None)
@@ -378,7 +412,7 @@ class NetGearUDP:
         for k in stale:
             fr = self._frames.pop(k, None)
             if fr:
-                self._total_packets_lost += 1
+                self._total_packets_lost += 1  # 内部记账，get_stats 不再暴露
 
     def _update_seq_stats(self, seq: int) -> None:
         if self._base_seq is None:
@@ -428,6 +462,7 @@ class NetGearUDP:
             _fraction = rb[0]
             cum_lost = int.from_bytes(rb[1:4], "big", signed=False)
             ext_seq, jitter, lsr, dlsr = struct.unpack("!IIII", rb[4:24])
+            # 保留内部 RTT 估计，但不对外暴露
             if lsr != 0:
                 now_sec, now_frac = _unix_to_ntp(_now_unix())
                 A = ((now_sec & 0xFFFF) << 16) | ((now_frac >> 16) & 0xFFFF)
@@ -471,14 +506,13 @@ class NetGearUDP:
         向对端发送一个“帧”（可切片多个 RTP 包）。
         参数:
           - frame: 待发送字节
-          - pkt_type: 负载类型（PKT_DATA/PKT_RES/PKT_SV_DATA/PKT_TERM）
+          - pkt_type: 负载类型（PKT_DATA/PKT_RES/PKT_SV_DATA/PKT_TERM/PKT_ACK_PACKET）
           - frame_id: 指定该帧的 frame_id；None 则使用内部自增
         """
         if frame is None:
             return
         if self._peer_addr is None and not self._recv_mode:
-            # 主动发送端：构造时已指定 address:port；接收端：收过一次后会记录 _peer_addr
-            pass
+            pass  # 主动发送端构造时已指定 address:port
 
         data = bytes(frame)
         fid = int(frame_id) if frame_id is not None else int(self._frame_id)
@@ -506,7 +540,6 @@ class NetGearUDP:
                 if self._peer_addr:
                     self._sock.sendto(pkt, self._peer_addr)
                 else:
-                    # 退路（理论上不应命中）
                     self._sock.send(pkt)
             except Exception as e:
                 self._logging and logger.warning(f"send error: {e}")
@@ -551,13 +584,19 @@ class NetGearUDP:
                 pass
 
     def get_stats(self) -> Dict[str, Any]:
+        """
+        公开的统计字段（按你的新口径）：
+          - total_frames_received: 已完整重组的帧数量（含数据帧与 ACK 帧）
+          - total_packets_received: 【修改定义】仅统计 ACK 包的接收次数
+          - queue_size, frames_in_progress
+          - jitter, sent_packets, sent_octets
+        不再暴露：total_packets_lost、rtt_ms
+        """
         return {
             "total_frames_received": self._total_frames_received,
-            "total_packets_received": self._total_packets_received,
-            "total_packets_lost": self._total_packets_lost,
+            "total_packets_received": self._total_packets_received,  # 仅 ACK 计数
             "queue_size": len(self._queue),
             "frames_in_progress": len(self._frames),
-            "rtt_ms": self._rtt_ms,
             "jitter": self._jitter,
             "sent_packets": self._sent_packets,
             "sent_octets": self._sent_octets
