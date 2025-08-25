@@ -22,11 +22,11 @@ from PIL import Image
 import torch
 
 # 统一入口：保持与其他文件一致的导入
-from net.vidgear.vidgear.gears.unified_netgear import NetGearLike as NetGear
+from vidgear.gears.unified_netgear import NetGearLike as NetGear
 
 # ====== 导入 pkt_type 常量 ======
 try:
-    from net.vidgear.vidgear.gears.netgear_udp import PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM  # type: ignore
+    from vidgear.gears.netgear_udp import PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM  # type: ignore
 except Exception:
     PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM = 0, 1, 2, 3
 
@@ -140,7 +140,6 @@ def video_to_temp_frames(video: Path, resize: Optional[str], tmp_dir: Path) -> T
 # ------------------------------
 def _sync_cuda():
     try:
-        import torch
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     except Exception:
@@ -157,7 +156,6 @@ class Pix2PixRunner:
             sys.path.insert(0, str(root))
         from models import create_model     # noqa
         from configs import decode_config   # noqa
-        import torch
 
         self._create_model = create_model
         self._decode_config = decode_config
@@ -208,7 +206,7 @@ class Pix2PixRunner:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def _smart_load(self, net, ckpt_path: str):
-        import torch, collections
+        import collections
         raw = torch.load(ckpt_path, map_location='cpu')
         if isinstance(raw, dict):
             for k in ['state_dict','model','netG','G']:
@@ -236,7 +234,6 @@ class Pix2PixRunner:
               f'unexpected={len(unexpected)} | shape_mismatch={len(mis_shape)}')
 
     def infer_numpy(self, rgb_np: np.ndarray) -> np.ndarray:
-        import torch
         with torch.no_grad():
             A = torch.from_numpy(rgb_np.transpose(2,0,1)).float().unsqueeze(0)
             A = (A * 2.0 - 1.0).to(self.device)
@@ -276,18 +273,16 @@ class GraceBundle:
                 sys.path.insert(0, str(c))
 
         self.ae = None
-        # 优先大写路径
-        try:
-            from Intrinsic.intrinsic.Grace.ins import init_ae_model  # noqa
-            models = init_ae_model()
-            self.ae = models[model_id]
-            print('[GraceBundle] 使用 Intrinsic.intrinsic.Grace.ins.AEModel')
-        except Exception as e1:
-            print('[GraceBundle] 加载 Intrinsic.intrinsic.Grace.ins 失败，回退小写：', repr(e1))
-            from Intrinsic.intrinsic.Grace.ins import init_ae_model  # type: ignore
-            models = init_ae_model()
-            self.ae = models[model_id]
-            print('[GraceBundle] 使用 Intrinsic.intrinsic.Grace.ins.AEModel')
+        # 获取当前文件的目录
+        current_dir = os.path.dirname(__file__)
+        # 找到向外两层的目录
+        parent_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
+        sys.path.append(parent_dir)
+        
+        from Intrinsic.intrinsic.Grace.ins import init_ae_model  # noqa
+        models = init_ae_model()
+        self.ae = models[model_id]
+        print('[GraceBundle] 使用 Intrinsic.intrinsic.Grace.ins.AEModel')
 
         # 读取步长（可能不存在）
         ws = getattr(self.ae, 'w_step', None)
@@ -305,7 +300,6 @@ class GraceBundle:
 
     @staticmethod
     def _pil_to_chw_tensor(img: Image.Image):
-        import torch
         arr = np.asarray(img).astype(np.float32) / 255.0
         ten = torch.from_numpy(arr.transpose(2,0,1))
         if torch.cuda.is_available():
@@ -368,7 +362,6 @@ class GraceBundle:
 
         # 转 numpy [H,W,3] in [0,1]
         try:
-            import torch
             if isinstance(decoded, torch.Tensor):
                 dec = decoded.detach().float().cpu().numpy().transpose(1, 2, 0)
                 return np.clip(dec, 0.0, 1.0)
@@ -848,7 +841,7 @@ if __name__ == '__main__':
 
 
 '''
-python shb_viduce_server_sender.py \
+python shb_udp_server_sender.py \
   --rgb-dir /data/wxk/workspace/mirage/dataset/video000/rgb \
   --fps 30 --mode g5_pix2pix_grace \
   --pix2pix-ckpt  /data/wxk/workspace/mirage/dataset/video000/pix2pix_nb/log/albedo/compressed888/latest_net_G.pth \

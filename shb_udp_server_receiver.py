@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 import shutil
 # ========= 保持你的原始导入与常量（不动）=========
-from net.vidgear.vidgear.gears.unified_netgear import NetGearLike as NetGear
+from vidgear.gears.unified_netgear import NetGearLike as NetGear
 
 SAVE_DIR = "/data/wxk/workspace/mirage/dataset/video000/Viduce/reciever_out"
 # 删除SAVE_DIR文件夹
@@ -64,6 +64,10 @@ for p in [str(_CUR), str(Path(SAVE_DIR).resolve().parent), str(Path(SAVE_DIR).re
         sys.path.insert(0, p)
 
 # iter_read_grace_records: 读取 bin 中的记录流；GraceBundle: 封装 AE 解码接口
+# 找到向外两层的目录
+current_dir = os.path.dirname(__file__)
+parent_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
+sys.path.append(parent_dir)
 from shb_viduce_runner import iter_read_grace_records, GraceBundle  # noqa: E402
 
 # ========= 工具函数：把 numpy(RGB,[0,1]) 转 PIL =========

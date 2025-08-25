@@ -18,9 +18,10 @@ import argparse
 import csv
 import json
 import subprocess
-import os
+import torch
 import re
 import sys
+import os
 import tempfile
 import time
 import math
@@ -35,23 +36,28 @@ from PIL import Image
 # ===================== 依赖导入 =====================
 
 # 统一入口：保持与其他文件一致的导入（NetGear 外观类）
-from net.vidgear.vidgear.gears.unified_netgear import NetGearLike as NetGear
+from vidgear.gears.unified_netgear import NetGearLike as NetGear
 
 # pkt_type 常量
 try:
-    from net.vidgear.vidgear.gears.netgear_udp import PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM  # type: ignore
+    from vidgear.gears.netgear_udp import PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM  # type: ignore
 except Exception as e:
     raise RuntimeError(f"[Init] 无法导入 NetGear UDP 常量: {e}")
 
+try:
+    from ns3.sender import sendFrame
+except Exception as e:
+    raise RuntimeError(f"[Init] 无法导入 ns3 函数: {e}")
+
 # 【新增】ACK 常量
 try:
-    from net.vidgear.vidgear.gears.netgear_udp import PKT_ACK_PACKET  # type: ignore
+    from vidgear.gears.netgear_udp import PKT_ACK_PACKET  # type: ignore
 except Exception:
     PKT_ACK_PACKET = 4  # 兜底
 
 # 仅用于“查表计算冗余率”的策略类（不使用 WebRTC 发送栈）
 try:
-    from net.vidgear.vidgear.gears.netgear_webrtc import WebRtcPolicy  # type: ignore
+    from vidgear.gears.netgear_webrtc import WebRtcPolicy  # type: ignore
 except Exception as e:
     raise RuntimeError(f"[Init] 无法导入 WebRtcPolicy（需要用它查表得到冗余率）：{e}")
 
@@ -86,10 +92,11 @@ def ensure_global_netgear() -> NetGear:
             protocol="udp",
             receive_mode=True,   # 接收 ACK
             logging=True,
-            mtu=1400,
+            mtu=1500,
             send_buffer_size=32 * 1024 * 1024,
             recv_buffer_size=32 * 1024 * 1024,
             queue_maxlen=65536,
+            deliver_per_packet=True,
         )
         # 【新增】指定对端 => 127.0.0.1:5557
         _GLOBAL_NET._peer_addr = (PEER_ADDR, PEER_PORT)
@@ -398,7 +405,6 @@ class Pix2PixRunner:
             sys.path.insert(0, str(root))
         from models import create_model     # noqa
         from configs import decode_config   # noqa
-        import torch
 
         self._create_model = create_model
         self._decode_config = decode_config
@@ -445,11 +451,9 @@ class Pix2PixRunner:
         self.config = self._decode_config(config_str) if (config_str and len(config_str) > 0) else None
         self.device = getattr(self.model, 'device', None)
         if self.device is None:
-            import torch
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def infer_numpy(self, rgb_np: np.ndarray) -> np.ndarray:
-        import torch
         with torch.no_grad():
             A = torch.from_numpy(rgb_np.transpose(2,0,1)).float().unsqueeze(0)
             A = (A * 2.0 - 1.0).to(self.device)
@@ -484,6 +488,10 @@ class GraceBundle:
             if c and str(c) not in sys.path:
                 sys.path.insert(0, str(c))
         try:
+            # 找到向外两层的目录
+            current_dir = os.path.dirname(__file__)
+            parent_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
+            sys.path.append(parent_dir)
             from Intrinsic.intrinsic.Grace.ins import init_ae_model  # noqa
         except Exception as e:
             raise RuntimeError(f"[Grace] 导入 AE 失败：{e}")
@@ -497,7 +505,6 @@ class GraceBundle:
     def encode_keyframe(self, ref_np: np.ndarray, cur_np: np.ndarray, is_iframe: bool):
         # 这里直接调用你原本的 AE 接口；失败就抛错
         try:
-            import torch
             from PIL import Image
             def _np2pil(x):
                 arr = (np.clip(x,0.0,1.0)*255.0).astype(np.uint8) if x.dtype!=np.uint8 else x
@@ -662,19 +669,11 @@ def send_file_via_netgear(frame_data: bytes, frame_id: int, fps: float) -> None:
     fec_rate = compute_webrtc_fec_rate_strict(
         loss_rate=loss_rate, rtt_ms=rtt_ms, fps=float(fps), bitrate_mbps=NS3_DEFAULT_BITRATE_MBPS
     )
-
-    # 4)（可选）调用 ns3(...)，此处仍保持占位
-    # if "ns3" not in globals():
-    #     raise RuntimeError("[Send] 未找到全局函数 ns3(...)")
-    # data_to_send = ns3(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms, fec_rate=fec_rate)  # noqa: F821
-    data_to_send = frame_data
-
-    # 【修改】不再在负载前添加发送时间戳（由接收端从头部获取）
-    # for pkt in data_to_send:
-    #      net.send(pkt)
-    # 直接发送
-    net.send(data_to_send, pkt_type=PKT_SV_DATA, frame_id=frame_id)
-    print(f"[Sender] frame_id={frame_id} 已发送 | bytes={len(data_to_send)} | loss={loss_rate:.4f}, rtt={rtt_ms:.2f}ms, fec={fec_rate:.4f}")
+    # 调用ns3来分包
+    pkts = sendFrame(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms, fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)
+    for raw in pkts:
+        net.send(raw)
+    print(f"[Sender] frame_id={frame_id} 已发送 | bytes={len(frame_data)} | loss={loss_rate:.4f}, rtt={rtt_ms:.2f}ms, fec={fec_rate:.4f}")
 
 # ===================== 主流程（按你原设计的 g5_*） =====================
 
@@ -686,7 +685,6 @@ class FrameRec:
 
 def _sync_cuda():
     try:
-        import torch
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     except Exception:
