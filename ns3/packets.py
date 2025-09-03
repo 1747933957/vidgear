@@ -30,55 +30,63 @@ def _unpack(fmt: str, data: bytes, offset: int = 0):
 
 @dataclass
 class DataPacket:
+    packet_id: int          # 新增：全局递增的包ID
     frame_id: int
     frame_len: int
     frame_pkt_num: int
     pkt_id_in_frame: int
     payload: bytes
-    HDR_FMT: ClassVar[str] = "!2sBBI I H H H"
+    # 外层头部增加一个 I（packet_id），统一放在 TYPE 之后
+    HDR_FMT: ClassVar[str] = "!2sBBI I I H H H"
     HDR_SIZE: ClassVar[int] = struct.calcsize(HDR_FMT)
     def to_bytes(self) -> bytes:
         pay_len = len(self.payload)
-        hdr = _pack(self.HDR_FMT, MAGIC, VER, T_DATA, self.frame_id, self.frame_len,
+        hdr = _pack(self.HDR_FMT, MAGIC, VER, T_DATA,
+                    self.packet_id,              # 新增字段写入
+                    self.frame_id, self.frame_len,
                     self.frame_pkt_num, self.pkt_id_in_frame, pay_len)
         return hdr + self.payload
     @classmethod
     def from_bytes(cls, data: bytes) -> "DataPacket":
-        (magic, ver, typ, fid, flen, n, pid, plen), p = _unpack(cls.HDR_FMT, data, 0)
+        (magic, ver, typ, pid, fid, flen, n, pkt_in_f, plen), p = _unpack(cls.HDR_FMT, data, 0)
         assert magic == MAGIC and ver == VER and typ == T_DATA, "Not a DataPacket"
         payload = data[p:p+plen]
-        return cls(fid, flen, n, pid, payload)
+        return cls(pid, fid, flen, n, pkt_in_f, payload)
 
 @dataclass
 class FecPacket:
+    packet_id: int          # 新增
     frame_id: int
     covered_ids: List[int]
     parity: bytes
-    HDR_FMT: ClassVar[str] = "!2sBBI H"
+    HDR_FMT: ClassVar[str] = "!2sBBI I H"  # 增加 I 承载 packet_id
     HDR_SIZE: ClassVar[int] = struct.calcsize(HDR_FMT)
     def to_bytes(self) -> bytes:
         cnt = len(self.covered_ids)
-        hdr = _pack(self.HDR_FMT, MAGIC, VER, T_FEC, self.frame_id, cnt)
+        hdr = _pack(self.HDR_FMT, MAGIC, VER, T_FEC,
+                    self.packet_id,           # 新增字段写入
+                    self.frame_id, cnt)
         ids = b"".join(_pack('!H', i) for i in self.covered_ids)
         par_len = _pack('!H', len(self.parity))
         return hdr + ids + par_len + self.parity
     @classmethod
     def from_bytes(cls, data: bytes) -> "FecPacket":
-        (magic, ver, typ, fid, cnt), p = _unpack(cls.HDR_FMT, data, 0)
+        (magic, ver, typ, pid, fid, cnt), p = _unpack(cls.HDR_FMT, data, 0)
         assert magic == MAGIC and ver == VER and typ == T_FEC, "Not a FecPacket"
         covered = []
         for _ in range(cnt):
             (i,), p = _unpack("!H", data, p); covered.append(i)
         (plen,), p = _unpack("!H", data, p)
         parity = data[p:p+plen]
-        return cls(fid, covered, parity)
+        return cls(pid, fid, covered, parity)
 
 @dataclass
 class XorPacket:
+    packet_id: int           # 新增
     anchor_frame_id: int
     items: List[Tuple[int, int, int]]  # (frameId, fullLen32, credit16)
     budget: int
-    OUTER_FMT: ClassVar[str] = "!2sBBI I"
+    OUTER_FMT: ClassVar[str] = "!2sBBI I I"  # 增加 I 承载 packet_id
     OUTER_SIZE: ClassVar[int] = struct.calcsize(OUTER_FMT)
     def to_bytes(self) -> bytes:
         meta_overhead = 8
@@ -86,7 +94,9 @@ class XorPacket:
         need = meta_overhead + len(self.items) * item_size
         if self.budget < need:
             raise ValueError(f"XorPacket: items metadata length exceeds budget (need={need}, budget={self.budget})")
-        outer = _pack(self.OUTER_FMT, MAGIC, VER, T_XOR, self.anchor_frame_id, self.budget)
+        outer = _pack(self.OUTER_FMT, MAGIC, VER, T_XOR,
+                      self.packet_id,           # 新增字段写入
+                      self.anchor_frame_id, self.budget)
         inner = bytearray()
         inner += XOR_MAGIC3
         inner += bytes([XOR_VER])
@@ -98,13 +108,13 @@ class XorPacket:
         return outer + bytes(inner)
     @classmethod
     def from_bytes(cls, data: bytes) -> "XorPacket":
-        (magic, ver, typ, anchor, budget), p = _unpack(cls.OUTER_FMT, data, 0)
+        (magic, ver, typ, pid, anchor, budget), p = _unpack(cls.OUTER_FMT, data, 0)
         assert magic == MAGIC and ver == VER and typ == T_XOR, "Not a XorPacket"
         inner = data[p:p+budget]
         if len(inner) < 4:
-            return cls(anchor, [], budget)
+            return cls(pid, anchor, [], budget)
         if inner[:3] != XOR_MAGIC3 or inner[3] != XOR_VER:
-            return cls(anchor, [], budget)
+            return cls(pid, anchor, [], budget)
         off  = struct.unpack("!H", inner[4:6])[0]
         cnt  = struct.unpack("!H", inner[6:8])[0]
         meta_overhead = 8
@@ -118,4 +128,4 @@ class XorPacket:
             fid, length32, credit16 = struct.unpack("!IIH", inner[pos:pos+10])
             items.append((fid, length32, credit16))
             pos += 10
-        return cls(anchor, items, budget)
+        return cls(pid, anchor, items, budget)

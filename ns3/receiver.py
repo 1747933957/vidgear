@@ -92,37 +92,42 @@ def receive_packet(data: bytes) -> List[int]:
     """
     newly: List[int] = []
     if len(data) < 4 or data[:2] != MAGIC or data[2] != VER:
-        return newly
+        print(f"{len(data)} {data[:2]} {data[2]}")
+        return newly, 0
     typ = data[3]
 
+    packet_id = 0
     # -------- Data --------
     if typ == T_DATA:
         dp = DataPacket.from_bytes(data)
+        packet_id = dp.packet_id
         frame_body_bytes.setdefault(dp.frame_id, dp.frame_len)
         frame_pkt_num.setdefault(dp.frame_id, dp.frame_pkt_num)
         frame_chunks.setdefault(dp.frame_id, set()).add(dp.pkt_id_in_frame)
 
         _try_finalize(dp.frame_id, newly)
         _process_pending_xor(newly)
-        return newly
+        return newly, packet_id
 
     # -------- FEC（仅作为提示）--------
     if typ == T_FEC:
         fp = FecPacket.from_bytes(data)
+        packet_id = fp.packet_id
         # 不做真实 FEC 恢复，仅尝试触发 XOR 队列再处理
         frame_chunks.get(fp.frame_id, set()).add(len(frame_chunks.get(fp.frame_id, set())))
         _try_finalize(fp.frame_id, newly)
         _process_pending_xor(newly)
 
-        return newly
+        return newly, packet_id
 
     # -------- XOR --------
     if typ == T_XOR:
         try:
             xp = XorPacket.from_bytes(data)
         except Exception:
-            return newly
+            return newly, packet_id
 
+        packet_id = xp.packet_id
         items = xp.items
         # 阶段 A：可解性
         missing_cnt = 0
@@ -137,7 +142,7 @@ def receive_packet(data: bytes) -> List[int]:
 
         if missing_cnt > 1:
             undecoded_xor_payloads.append(data)
-            return newly
+            return newly, packet_id
 
         # 阶段 B：可解 -> 饱和累加 credit
         for (fid, full16, cred16) in items:
@@ -154,6 +159,6 @@ def receive_packet(data: bytes) -> List[int]:
             _try_finalize(fid, newly)
         #         frame_chunks.get(xp.frame_id, set()).add(len(frame_chunks.get(xp.frame_id, set())))
         # _try_finalize(fid, newly)
-        return newly
+        return newly, packet_id
 
-    return newly
+    return newly, packet_id

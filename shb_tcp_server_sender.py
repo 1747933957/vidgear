@@ -24,7 +24,7 @@ import torch
 from vidgear.gears.unified_netgear import NetGearLike as NetGear
 
 # ====== 常量配置 ======
-CLIENT_ADDR = "127.0.0.1" # 本机测试："172.27.143.41"
+CLIENT_ADDR = "172.27.143.41" # 本机测试："172.27.143.41"
 CLIENT_PORT = 5556           # client 绑定的端口
 
 # ------------------------------
@@ -702,8 +702,12 @@ def run_g5_pix2pix_grace(args, frames: List[Path], pix: Pix2PixRunner, grace: Gr
         rgb0 = load_rgb_np(f0)
 
         _sync_cuda()
-        t0 = time.perf_counter()
+        t_pix0 = time.perf_counter()
         rgb0_pix = pix.infer_numpy(rgb0)   # 生成后的图
+        _sync_cuda()
+        t_pix1 = time.perf_counter()
+        t_pix_ms = int(round((t_pix1 - t_pix0) * 1000))
+
 
         # 确定参考帧与 is_iframe（不计 IO/保存时间）
         if global_frame_idx == 0:
@@ -719,13 +723,15 @@ def run_g5_pix2pix_grace(args, frames: List[Path], pix: Pix2PixRunner, grace: Gr
                 if prev_group_key_np is None:
                     raise RuntimeError('串行模式下找不到上一组关键帧参考')
                 ref_np = prev_group_key_np
-
+        
+        _sync_cuda()
+        t_ge0 = time.perf_counter()
         size0, dec0_np, eframe, compressed_data = grace.encode_keyframe(ref_np=ref_np, cur_np=rgb0_pix, is_iframe=is_iframe)
         _sync_cuda()
-        t1 = time.perf_counter()
-        dt_ms = int(round((t1 - t0) * 1000))
-        print(f'  [KEY] size={size0}  time_ms={dt_ms}')
-        recs.append(FrameRec(idx=s, size=size0, time_ms=dt_ms))
+        t_ge1 = time.perf_counter()
+        t_grace_ms = int(round((t_ge1 - t_ge0) * 1000))
+        print(f'  [KEY] size={size0}  pix2pix_ms={t_pix_ms}  grace_enc_ms={t_grace_ms}')
+        recs.append(FrameRec(idx=s, size=size0, pix2pix_ms=t_pix_ms, grace_enc_ms=t_grace_ms))
 
         # 保存编码后的关键帧
         out_bin_path = args.out_dir / f'grace_stream_{(s):04d}.bin'
@@ -758,10 +764,10 @@ def run_g5_pix2pix_grace(args, frames: List[Path], pix: Pix2PixRunner, grace: Gr
             sizej, mv_j, shape_j = grace.mv_only_size(prev_np=prev_np, cur_np=cur_np)
             _sync_cuda()
             t3 = time.perf_counter()
-            dt_ms_j = int(round((t3 - t2) * 1000))
+            t_grace_ms = int(round((t3 - t2) * 1000))
 
-            print(f'  [MV]  frame={fj.name}  size={sizej}  time_ms={dt_ms_j}')
-            recs.append(FrameRec(idx=s+j, size=sizej, time_ms=dt_ms_j))
+            print(f'  [MV]  frame={fj.name}  size={sizej}  pix2pix_ms=0  grace_enc_ms={t_grace_ms}')
+            recs.append(FrameRec(idx=s+j, size=sizej, pix2pix_ms=0, grace_enc_ms=t_grace_ms))
 
 
             # 保存mv_j到文件

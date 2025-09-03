@@ -44,7 +44,7 @@ DEFAULT_FPS = 30.0
 
 # ========== 3) UDP 协议的 pkt_type 常量 ==========
 from vidgear.gears.netgear_udp import (
-    PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM, PKT_ACK_PACKET
+    PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM, PKT_ACK_PACKET, PKT_PING, PKT_PONG,
 )  # 仅取常量，不改其实现
 
 # ========== 4) FEC 策略与 ns3 分包：保持原有调用 ==========
@@ -87,11 +87,48 @@ def shutdown_global_udp():
         finally:
             _GLOBAL_UDP = None
 
-# ========== 6) ACK/RES 后台接收与 RTT 维护 ==========
-_ACK_FMT = "!d"                          # 仅有 send_ts: double(秒)
+# ========== 6) ACK/RES/PING-PONG & 按帧统计 ==========
+# 【更新】ACK 负载：!id = [frame_id:int32, send_ts:double秒]
+_ACK_FMT = "!id"
 _ACK_SIZE = struct.calcsize(_ACK_FMT)
-_RTT_MS_LAST = float("nan")              # 最近一次ACK计算出的RTT(ms)
+
+# RTT 统计（保留你之前的“最近一次”口径）
+_RTT_MS_LAST = float("nan")
 _RTT_LOCK = threading.Lock()
+
+# 【新增】client 侧时间日志（CSV）
+from pathlib import Path as _Path
+_CLIENT_LOG = _Path("./client_times.csv")  # 新增变量：client 时延日志路径
+if not _CLIENT_LOG.exists():
+    with _CLIENT_LOG.open("w", newline="") as f:
+        import csv as _csv
+        w = _csv.writer(f)
+        # 列：帧编号、总时延(ms)、传播时延(ms)、该帧传输数据量(字节)
+        w.writerow(["frame_id","total_ms","prop_ms","bytes_total"])
+
+# 【新增】每帧累积表与锁
+_PER_FRAME = {}   # type: Dict[int, Dict[str, float]]
+_PER_LOCK   = threading.Lock()
+
+def _pf_update(fid: int, **kv):
+    """安全更新某帧字段"""
+    with _PER_LOCK:
+        rec = _PER_FRAME.setdefault(int(fid), {})
+        rec.update(kv)
+
+def _try_flush(fid: int):
+    """当该帧具备 total_ms/prop_ms/bytes_total 三者时，写 CSV 并删除条目"""
+    with _PER_LOCK:
+        rec = _PER_FRAME.get(int(fid), {})
+        total_ms = rec.get("total_ms")
+        prop_ms = rec.get("prop_ms")
+        bytes_total = rec.get("bytes_total")
+        if (total_ms is not None) and (prop_ms is not None) and (bytes_total is not None):
+            import csv as _csv
+            with _CLIENT_LOG.open("a", newline="") as f:
+                _csv.writer(f).writerow([int(fid), int(round(total_ms)), int(round(prop_ms)), int(bytes_total)])
+            del _PER_FRAME[int(fid)]
+
 
 def get_last_rtt_ms():
     with _RTT_LOCK:
@@ -110,16 +147,43 @@ def _ack_res_rx_loop(net: NetGear):
             continue
         pkt_type = int(item.get("pkt_type", -1))
         data: bytes = item.get("data", b"")
+
+        # 【新增】PONG：近似传播时延=RTT/2
+        if pkt_type == PKT_PONG:
+            try:
+                fid, ping_ts = struct.unpack("!id", data[:struct.calcsize("!id")])
+                rtt = max(0.0, (time.time() - float(ping_ts)) * 1000.0)
+                prop_ms = max(0.0, (time.time() - float(ping_ts)) * 1000.0) / 2.0
+                _pf_update(int(fid), prop_ms=float(prop_ms))
+                _try_flush(int(fid))
+                with _RTT_LOCK:
+                    _RTT_MS_LAST = rtt
+            except Exception:
+                pass
+            continue
+
+        # 【更新】ACK：每帧一次；总时延= ack_recv - send_start
         if pkt_type == PKT_ACK_PACKET:
             if len(data) >= _ACK_SIZE:
                 try:
-                    (send_ts,) = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
-                    rtt = max(0.0, (time.time() - float(send_ts)) * 1000.0)
-                    with _RTT_LOCK:
-                        _RTT_MS_LAST = rtt
+                    fid, _send_ts = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
+                    # 记录 ACK 接收时刻；总时延稍后用 send_start 计算
+                    _pf_update(int(fid), t_ack_recv=float(time.time()))
+                    # 计算总时延（若已有 t_send_start）
+                    with _PER_LOCK:
+                        rec = _PER_FRAME.get(int(fid), {})
+                        t0 = rec.get("t_send_start")
+                    if t0 is not None:
+                        total_ms = max(0.0, (float(time.time()) - float(t0)) * 1000.0)
+                        _pf_update(int(fid), total_ms=float(total_ms))
+                    _try_flush(int(fid))
+
+                    # 同步更新“最近一次 RTT”（保留你原有逻辑）
+                    # rtt = max(0.0, (time.time() - float(_send_ts)) * 1000.0)
                 except Exception:
                     pass
             continue
+
         if pkt_type == PKT_RES:
             try:
                 text = data.decode("utf-8", errors="ignore")
@@ -202,9 +266,26 @@ def send_file_via_netgear(frame_data: bytes, frame_id: int, fps: float):
     )
     # 4) 调 ns3 分包并发送
     pkts = sendFrame(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms, fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)
+
+    # 【新增-1】发送 PING（含 frame_id 与 ping_ts），用于近似传播时延
+    ping_ts = time.time()
+    try:
+        net.send(struct.pack("!id", int(frame_id), float(ping_ts)), pkt_type=PKT_PING)
+    except Exception as e:
+        print(f"[Send] PING 失败: {e}")
+
+    # 【新增-2】记录“开始发送该帧数据”的时刻（PING 不计入总时延起点）
+    t0 = time.time()
+    _pf_update(int(frame_id), t_send_start=float(t0))
+
+    bytes_sum = 0
     for raw in pkts:
         # net._peer_addr = (UDP_DST_ADDR, UDP_DST_PORT)
-        net.send(raw)
+        net.send(raw, pkt_type=PKT_DATA)
+        bytes_sum += (len(raw) + 29)
+
+    _pf_update(int(frame_id), bytes_total=int(bytes_sum))
+    _try_flush(int(frame_id))  # 若 ACK/PONG 已到则会落盘并清理
     print(f"[Sender] frame_id={frame_id} bytes={len(frame_data)} loss={loss_rate:.4f} rtt={rtt_ms:.2f}ms fec={fec_rate:.4f}")
 
 # ========== 9) TCP（ZeroMQ/REQ-REP）接收：解析 frame_id 并转发 ==========
