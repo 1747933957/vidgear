@@ -429,8 +429,8 @@ def sendFrame(data: bytes, loss_rate: float, rtt_ms: int, fec_rate: float, max_p
     payload_cap = max_pay_load
 
     # === 在线模型预测（保持原有调用） ===
-    # pred_loss, pred_dur = predict_next_by_slow_module()
-    # print(pred_loss, pred_dur)
+    pred_loss, pred_dur = predict_next_by_slow_module()
+    print(pred_loss, pred_dur)
     L_cur = 5  # 这里保持现状；若要接入 pred_dur，可解注释并做限幅
 
     # 1) 计算 data 分片数量

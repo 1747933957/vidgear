@@ -8,8 +8,7 @@
 from __future__ import annotations
 from typing import Dict, Set, List, Tuple
 from .packets import DataPacket, FecPacket, XorPacket, MAGIC, VER, T_DATA, T_FEC, T_XOR
-from pathlib import Path
-import threading
+
 # =========================
 # 单实例接收上下文
 # =========================
@@ -22,26 +21,6 @@ frame_chunks: Dict[int, Set[int]] = {}    # fid -> 已收到分片 id 集合
 played_frames: Set[int] = set()           # 已完成的帧
 undecoded_xor_payloads: List[bytes] = []  # 暂不可解的 XOR 原始包（延后再试）
 max_pay_load = 1400  # 假设的最大包载荷（可根据实际情况调整）
-
-# === NEW: log config & helper ===
-LOG_PATH = Path("receive_packet.txt")
-LOG_LOCK = threading.Lock()
-
-def _log_packet(typ_str: str, packet_id: int, frame_id: int | str, xor_fids: List[int] | None = None) -> None:
-    """
-    将单个已解析包记录到 receive_packet.txt
-    行格式:
-        <packet_id>\t<frame_id>\t<type>[ \tframes=fid1,fid2,...]
-    - 对于 XOR 包, frame_id 记为 'NA', 并追加 frames= 列表
-    """
-    if xor_fids:
-        line = f"{packet_id}\t{frame_id}\t{typ_str}\tframes=" + ",".join(map(str, xor_fids)) + "\n"
-    else:
-        line = f"{packet_id}\t{frame_id}\t{typ_str}\n"
-    with LOG_LOCK:
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(line)
-
 
 def _is_frame_complete(fid: int) -> bool:
     if fid in played_frames:
@@ -113,48 +92,38 @@ def receive_packet(data: bytes) -> List[int]:
     """
     newly: List[int] = []
     if len(data) < 4 or data[:2] != MAGIC or data[2] != VER:
-        print(f"{len(data)} {data[:2]} {data[2]}")
-        return newly, 0
+        return newly
     typ = data[3]
 
-    packet_id = 0
     # -------- Data --------
     if typ == T_DATA:
         dp = DataPacket.from_bytes(data)
-        packet_id = dp.packet_id
         frame_body_bytes.setdefault(dp.frame_id, dp.frame_len)
         frame_pkt_num.setdefault(dp.frame_id, dp.frame_pkt_num)
         frame_chunks.setdefault(dp.frame_id, set()).add(dp.pkt_id_in_frame)
-        _log_packet("data", packet_id=dp.packet_id, frame_id=dp.frame_id)
+
         _try_finalize(dp.frame_id, newly)
         _process_pending_xor(newly)
-        return newly, packet_id
+        return newly
 
     # -------- FEC（仅作为提示）--------
     if typ == T_FEC:
         fp = FecPacket.from_bytes(data)
-        packet_id = fp.packet_id
-        _log_packet("fec", packet_id=fp.packet_id, frame_id=fp.frame_id)
         # 不做真实 FEC 恢复，仅尝试触发 XOR 队列再处理
         frame_chunks.get(fp.frame_id, set()).add(len(frame_chunks.get(fp.frame_id, set())))
         _try_finalize(fp.frame_id, newly)
         _process_pending_xor(newly)
 
-        return newly, packet_id
+        return newly
 
     # -------- XOR --------
     if typ == T_XOR:
         try:
             xp = XorPacket.from_bytes(data)
         except Exception:
-            return newly, packet_id
+            return newly
 
-        packet_id = xp.packet_id
         items = xp.items
-
-        xor_fids_for_log = [int(fid) for (fid, _, _) in items]
-        _log_packet("xor", packet_id=xp.packet_id, frame_id="NA", xor_fids=xor_fids_for_log)
-        
         # 阶段 A：可解性
         missing_cnt = 0
         touched: List[int] = []
@@ -168,7 +137,7 @@ def receive_packet(data: bytes) -> List[int]:
 
         if missing_cnt > 1:
             undecoded_xor_payloads.append(data)
-            return newly, packet_id
+            return newly
 
         # 阶段 B：可解 -> 饱和累加 credit
         for (fid, full16, cred16) in items:
@@ -185,6 +154,6 @@ def receive_packet(data: bytes) -> List[int]:
             _try_finalize(fid, newly)
         #         frame_chunks.get(xp.frame_id, set()).add(len(frame_chunks.get(xp.frame_id, set())))
         # _try_finalize(fid, newly)
-        return newly, packet_id
+        return newly
 
-    return newly, packet_id
+    return newly

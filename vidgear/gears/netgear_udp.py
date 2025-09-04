@@ -28,7 +28,10 @@ PKT_DATA = 0
 PKT_RES = 1
 PKT_SV_DATA = 2
 PKT_TERM = 3
-PKT_ACK_PACKET = 4  # ACK 包类型：收到后用于 _total_packets_received 计数
+PKT_ACK_FRAME = 4
+PKT_ACK_PACKET = 5
+PKT_PING = 6
+PKT_PONG = 7
 
 # ===================== 日志器 =====================
 logger = log.getLogger("NetGearUDP")
