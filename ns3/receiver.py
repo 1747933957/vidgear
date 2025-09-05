@@ -27,7 +27,7 @@ max_pay_load = 1400  # 假设的最大包载荷（可根据实际情况调整）
 LOG_PATH = Path("receive_packet.txt")
 LOG_LOCK = threading.Lock()
 
-def _log_packet(typ_str: str, packet_id: int, frame_id: int | str, xor_fids: List[int] | None = None) -> None:
+def _log_packet(typ_str: str, packet_id: int, frame_id: int | str,pkt_num: int = 0, xor_fids: List[int] | None = None) -> None:
     """
     将单个已解析包记录到 receive_packet.txt
     行格式:
@@ -37,7 +37,7 @@ def _log_packet(typ_str: str, packet_id: int, frame_id: int | str, xor_fids: Lis
     if xor_fids:
         line = f"{packet_id}\t{frame_id}\t{typ_str}\tframes=" + ",".join(map(str, xor_fids)) + "\n"
     else:
-        line = f"{packet_id}\t{frame_id}\t{typ_str}\n"
+        line = f"{packet_id}\t{frame_id}\t{typ_str}\t{pkt_num}\n"
     with LOG_LOCK:
         with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(line)
@@ -125,7 +125,7 @@ def receive_packet(data: bytes) -> List[int]:
         frame_body_bytes.setdefault(dp.frame_id, dp.frame_len)
         frame_pkt_num.setdefault(dp.frame_id, dp.frame_pkt_num)
         frame_chunks.setdefault(dp.frame_id, set()).add(dp.pkt_id_in_frame)
-        _log_packet("data", packet_id=dp.packet_id, frame_id=dp.frame_id)
+        _log_packet("data", packet_id=dp.packet_id, frame_id=dp.frame_id,pkt_num=dp.frame_pkt_num)
         _try_finalize(dp.frame_id, newly)
         _process_pending_xor(newly)
         return newly, packet_id

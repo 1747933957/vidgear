@@ -499,50 +499,50 @@ def sendFrame(data: bytes, loss_rate: float, rtt_ms: int, fec_rate: float, max_p
             g_sent_packets[pid] = {"frame_id": fid, "type": "fec", "acked": False}
             g_frame_meta[fid]["fec_pkt_ids"].append(pid)
             
-    # 9) 当前帧入队水库（从下一帧开始参与）
-    _enqueue_token_plan(fid, min(payload_cap, data_size), L_cur)
+    # # 9) 当前帧入队水库（从下一帧开始参与）
+    # _enqueue_token_plan(fid, min(payload_cap, data_size), L_cur)
 
-    # 7) 生成 XOR 包（anchor=当前帧；合并所有源）
-    xor_pkts: List[bytes] = []
-    if xor_budget_to_send > 0 and xor_info.sources:
-        items: List[Tuple[int,int,int]] = []
-        budget = xor_budget_to_send
-        # === NEW === 暂存 (src_fid, round_idx) 以便生成 pid 后建立 g_xor_pid_sources 映射
-        _src_round_list: List[Tuple[int, int]] = []
+    # # 7) 生成 XOR 包（anchor=当前帧；合并所有源）
+    # xor_pkts: List[bytes] = []
+    # if xor_budget_to_send > 0 and xor_info.sources:
+    #     items: List[Tuple[int,int,int]] = []
+    #     budget = xor_budget_to_send
+    #     # === NEW === 暂存 (src_fid, round_idx) 以便生成 pid 后建立 g_xor_pid_sources 映射
+    #     _src_round_list: List[Tuple[int, int]] = []
 
-        for (src_frame_id, give) in xor_info.sources:
-            length32 = min(1<<31-1, m_frame_body_bytes.get(src_frame_id, 0))
-            curL = budget             # 信用统一使用 τ（与 C++ 的“同一 XOR 对所有源给同等信用”一致）
-            items.append((int(src_frame_id), int(length32), int(curL)))
+    #     for (src_frame_id, give) in xor_info.sources:
+    #         length32 = min(1<<31-1, m_frame_body_bytes.get(src_frame_id, 0))
+    #         curL = budget             # 信用统一使用 τ（与 C++ 的“同一 XOR 对所有源给同等信用”一致）
+    #         items.append((int(src_frame_id), int(length32), int(curL)))
 
-            # === NEW === 标注“该源帧此次 XOR 的轮次”：取它当前 plan 的 k（提交前）
-            round_idx = 0
-            plan = g_plan_by_frame.get(src_frame_id)
-            if plan is not None:
-                round_idx = int(plan.k)  # 提交后才会 +1
-            # 记录到源帧的“轮次对应 pid 列表”中（先占位 -1，pid 生成后回填）
-            g_frame_meta.setdefault(src_frame_id, {}).setdefault("xor_round_pids", [])
-            g_frame_meta[src_frame_id]["xor_round_pids"].append(-1)
-            _src_round_list.append((src_frame_id, round_idx))
+    #         # === NEW === 标注“该源帧此次 XOR 的轮次”：取它当前 plan 的 k（提交前）
+    #         round_idx = 0
+    #         plan = g_plan_by_frame.get(src_frame_id)
+    #         if plan is not None:
+    #             round_idx = int(plan.k)  # 提交后才会 +1
+    #         # 记录到源帧的“轮次对应 pid 列表”中（先占位 -1，pid 生成后回填）
+    #         g_frame_meta.setdefault(src_frame_id, {}).setdefault("xor_round_pids", [])
+    #         g_frame_meta[src_frame_id]["xor_round_pids"].append(-1)
+    #         _src_round_list.append((src_frame_id, round_idx))
 
-        pid = _next_packet_id()
-        xp = XorPacket(packet_id=pid, anchor_frame_id=fid, items=items, budget=budget)
-        raw = xp.to_bytes()
-        g_sent_packets[pid] = {"frame_id": fid, "type": "xor", "acked": False}
-        g_frame_meta[fid]["xor_pkt_ids"].append(pid)
+    #     pid = _next_packet_id()
+    #     xp = XorPacket(packet_id=pid, anchor_frame_id=fid, items=items, budget=budget)
+    #     raw = xp.to_bytes()
+    #     g_sent_packets[pid] = {"frame_id": fid, "type": "xor", "acked": False}
+    #     g_frame_meta[fid]["xor_pkt_ids"].append(pid)
 
-        # === NEW === 回填：把占位 -1 改成真实 pid，并登记 pid -> (src_fid, round_idx)
-        g_xor_pid_sources[pid] = []
-        for (src_frame_id, round_idx) in _src_round_list:
-            lst = g_frame_meta[src_frame_id]["xor_round_pids"]
-            lst[-1] = pid
-            g_xor_pid_sources[pid].append((src_frame_id, round_idx))
+    #     # === NEW === 回填：把占位 -1 改成真实 pid，并登记 pid -> (src_fid, round_idx)
+    #     g_xor_pid_sources[pid] = []
+    #     for (src_frame_id, round_idx) in _src_round_list:
+    #         lst = g_frame_meta[src_frame_id]["xor_round_pids"]
+    #         lst[-1] = pid
+    #         g_xor_pid_sources[pid].append((src_frame_id, round_idx))
 
-        tail = b'\xff' * int(budget)   # 末尾追加长度为 budget 的全 1 payload（仅用于“占位带宽”，方便对齐 NS-3）
-        xor_pkts.append(raw + tail)
+    #     tail = b'\xff' * int(budget)   # 末尾追加长度为 budget 的全 1 payload（仅用于“占位带宽”，方便对齐 NS-3）
+    #     xor_pkts.append(raw + tail)
 
-    # 8) 提交本轮（推进水库）
-    _commit_after_send()
+    # # 8) 提交本轮（推进水库）
+    # _commit_after_send()
 
     # === 在返回前写入 sender 侧的 recv_stats.txt（发送时刻视角；后续 ACK 会覆写收敛） ===
     try:
@@ -568,7 +568,8 @@ def sendFrame(data: bytes, loss_rate: float, rtt_ms: int, fec_rate: float, max_p
         # 失败不影响原发送流程
         print(f"[sender stats warn] write failed for frame {fid}: {e}")
 
-    return data_pkts + fec_pkts + xor_pkts
+    return data_pkts + fec_pkts
+    # return data_pkts + fec_pkts + xor_pkts
 
 
 def _ack_packet(packet_id: int):
