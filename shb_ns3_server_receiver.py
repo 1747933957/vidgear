@@ -43,16 +43,13 @@ def _server_log_row(frame_id: int, dec_ms: int, yolo_ms: int):
         w = _csv.writer(f)
         w.writerow([int(frame_id), int(dec_ms), int(yolo_ms)])
 
-# ===== 绑定地址与端口（保持） =====
-BIND_ADDR = "114.212.86.152"  # 127.0.0.1, 114.212.86.152
+# ===== 绑定地址与端口 =====
+BIND_ADDR = "127.0.0.1"  # 127.0.0.1, 114.212.86.152
 PORT = 5558
 
-# ===== 回传给 client 的地址（保持） =====
-CLIENT_ADDR = "172.27.128.241"  # "172.27.149.174" "127.0.0.1""172.27.128.241"
+# ===== 回传给 client 的地址 =====
+CLIENT_ADDR = "127.0.0.1"  # "172.27.144.86" "127.0.0.1""172.27.128.241"
 CLIENT_PORT = 5559
-
-# ===== pkt_type 常量（保持）=====
-from vidgear.gears.netgear_udp import PKT_DATA, PKT_SV_DATA, PKT_RES, PKT_TERM, PKT_ACK_FRAME, PKT_ACK_PACKET, PKT_PING, PKT_PONG
 
 # ===== NS-3 收包函数（保持）=====
 try:
@@ -319,7 +316,7 @@ def _yolo_worker(net: NetGear, yolo_ctx: YOLOContext):
             yolo_res["frame_id"] = int(fid)
             body = json.dumps(yolo_res, ensure_ascii=False).encode("utf-8")
             payload = hdr + body
-            net.send(payload, pkt_type=PKT_RES)
+            net.send(payload, pkt_type=net.PKT_RES)  # 用实例上的常量
             print(f"[Server] Sent YOLO result: frame_id={fid}, size={len(payload)}, dec={dec_ms}ms, yolo={yolo_ms}ms")
         except Exception as e:
             print(f"[YOLO] frame {fid} 推理/回传失败: {e}")
@@ -351,9 +348,24 @@ def main():
         mtu=1500,
         recv_buffer_size=32 * 1024 * 1024,
         send_buffer_size=32 * 1024 * 1024,
-        queue_maxlen=655360
+        queue_maxlen=655360,
+        slow_log_dir="./tmp/slow_logs_receiver",          # 这端一般不会写 slow 日志，但可保留
+        slow_weights_path="./tmp/slow_module_weights.json",
+        rtcp_interval_ms=100,
     )
     net._peer_addr = (CLIENT_ADDR, CLIENT_PORT)
+
+    # === 在实例创建后，从实例上“绑定” pkt 常量到本地变量 ===
+    # 这样后面代码仍可以用 PKT_DATA 等名字，不改流程。
+    global PKT_DATA, PKT_SV_DATA, PKT_RES, PKT_TERM, PKT_ACK_FRAME, PKT_ACK_PACKET, PKT_PING, PKT_PONG
+    PKT_DATA = net.PKT_DATA
+    PKT_SV_DATA = net.PKT_SV_DATA
+    PKT_RES = net.PKT_RES
+    PKT_TERM = net.PKT_TERM
+    PKT_ACK_FRAME = net.PKT_ACK_FRAME
+    PKT_ACK_PACKET = net.PKT_ACK_PACKET
+    PKT_PING = net.PKT_PING
+    PKT_PONG = net.PKT_PONG
 
     # === 新增：只在启动时加载一次 YOLO ===
     # 新变量 yolo_ctx: YOLOContext —— 已加载的 YOLO 引擎或占位引擎
@@ -387,11 +399,10 @@ def main():
                         for fid in frame_ids:
                             if fid not in seen:
                                 seen.add(fid)
+                                ack_payload = struct.pack(_ACK_FMT, int(fid), time.time())
+                                net.send(ack_payload, pkt_type=PKT_ACK_FRAME)
                                 _q_decode.put(int(fid))      # 有界队列，必要时阻塞，给系统建立背压
                                 DONE_FRAMES.append(int(fid))  # 若其他模块需要观测
-
-                elif ptype == PKT_PING:
-                    net.send(data, pkt_type=PKT_PONG)
 
                 continue
 

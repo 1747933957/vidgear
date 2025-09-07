@@ -2,37 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-shb_ns3_client.py / phone 变体 —— Metrics 回放 + 多方法估计发送/传播时延（择优）
-
-功能总览：
-1) 从 metrics_serial.csv 读取第二列 size（单位：字节），每隔 interval_ms（默认 30ms）发送一帧。
-2) 帧内容随机生成（os.urandom），长度严格等于 size。
-3) 通过你实现的 UDP NetGear（unified_netgear.NetGearLike 封装的 netgear_udp）发送：
-   - 每帧发送前先发送一个 PING 包（结构: "!id" = [frame_id:int32, ping_ts:double]）
-   - 服务器 shb_ns3_server_receiver.py 收到 PING 立即 PONG 回显，客户端据此计算 RTT 与 RTT/2 传播近似。
-   - 服务器在“帧重组完成”时对该帧回一个 ACK（结构: "!id" = [frame_id:int32, server_send_ts:double]）。
-4) 客户端维护每帧的统计表，计算多种发送/传播时延，并基于残差最小原则选出“最终”组合：
-   - 发送时延（send_ms）候选：
-       A) send_ser_measured_ms = (t_send_end - t_send_start) * 1000
-       B) send_ser_bw_nominal_ms = bytes_total * 8 / (NS3_DEFAULT_BITRATE_MBPS*1e6) * 1000
-     同时计算 goodput_mbps = bytes_total * 8 / (t_send_end - t_send_start) / 1e6
-   - 传播时延（prop_ms）候选：
-       A) prop_ping_ms = PING_RTT/2
-       B) prop_from_ack_minus_send_ms = max(0, total_ms - send_ser_measured_ms)
-   - 选择 (send, prop) 使 | total_ms - send - prop | 最小，且均非负。
-5) 将所有方法的值 + 最终选型写入 client_times.csv，并在写入后删除该帧的内存条目，避免增长。
-
-CSV 输出列（按顺序）：
-    frame_id, bytes_total, total_ms,
-    ping_rtt_ms, ping_prop_ms,
-    send_ser_measured_ms, send_ser_bw_nominal_ms, send_goodput_mbps,
-    prop_from_ack_minus_send_ms,
-    final_send_ms, final_prop_ms, method_pair
+shb_ns3_client_phone.py —— 使用 unified_netgear 的 NetGearLike 封装发送数据
+本版更新要点：
+  - send_file_via_netgear：loss_rate 从 RTCP 获取；rtt_ms 从底层 PING/PONG 获取；
+  - 'tooth' 分支：调用 net.get_slow_prediction() 使用慢模块最新建议的 fec_suggest；
+  - 其它逻辑沿用你之前版本；不直接导入 PKT_*，通过 net.is_* 判断类型。
 """
 
 import argparse
 import csv
-import json
 import math
 import os
 import struct
@@ -40,132 +18,95 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
 
-import numpy as np
-
-# ========== 1) UDP 入口 ==========
-# 说明：优先使用你封装的 NetGearLike；若不可用则给出最小兜底（不建议长期使用）
+# 统一封装（内部应路由到 NetGearUDP）
 try:
-    from vidgear.gears.unified_netgear import NetGearLike as NetGear  # 你的 UDP 封装
+    from vidgear.gears.unified_netgear import NetGearLike as NetGear
+    from vidgear.gears.tooth_fast_module import ToothFastModuleRF
 except Exception:
     NetGear = None  # type: ignore
 
-# ========== 2) pkt_type 常量 ==========
-# 来自你定制的 netgear_udp；若导入失败，定义兜底值（务必与服务端一致）
-from vidgear.gears.netgear_udp import PKT_DATA, PKT_RES, PKT_SV_DATA, PKT_TERM, PKT_ACK_FRAME, PKT_ACK_PACKET, PKT_PING, PKT_PONG
-
-# ========== 3) FEC 策略与 ns3 分包：若环境具备则调用真实实现 ==========
-# WebRTC 策略（可选，用于计算 fec_rate）
 try:
-    from vidgear.gears.netgear_webrtc import WebRtcPolicy  # 你之前的 Python 版策略封装
+    from vidgear.gears.webrtc_interface import WebRtcPolicy
 except Exception:
     WebRtcPolicy = None  # type: ignore
 
-# ns3 分包函数（可选，若不可用则退化为本地分片）
-from ns3.sender import sendFrame, _ack_packet, _report_stats
+from ns3.sender import sendFrame  # 分片（可选）
 
-# ========== 4) 运行参数（按你先前的口径） ==========
-UDP_BIND_ADDR: str = "0.0.0.0"       # 本地 UDP 绑定地址（收 ACK/PONG）
-UDP_BIND_PORT: int = 5559            # 本地 UDP 端口
-UDP_DST_ADDR: str = "114.212.86.152" # 服务器地址（同你之前）
-UDP_DST_PORT: int = 5558             # 服务器端口（同你之前）
+UDP_BIND_ADDR: str = "0.0.0.0"
+UDP_BIND_PORT: int = 5559
+UDP_DST_ADDR: str = "127.0.0.1"
+UDP_DST_PORT: int = 5558
 
-DEFAULT_MTU: int = 1500              # 以太网 MTU
-MAX_PAYLOAD: int = 1400              # 应用层单包最大负载（避免 IP 分片；真实以你的实现为准）
-APP_HEADER_BYTES: int = 29           # 【关键】你的应用层自定义头部长度；统计 bytes_total 时要包含
-NS3_DEFAULT_BITRATE_MBPS: float = 20.0  # 名义链路带宽（用于理论发送时延的估计）
+DEFAULT_MTU: int = 1500
+MAX_PAYLOAD: int = 1400
+APP_HEADER_BYTES: int = 29
+NS3_DEFAULT_BITRATE_MBPS: float = 20.0
 
-# ========== 5) ACK/RES/PING-PONG 负载格式 ==========
-# ACK: "!id" = [frame_id:int32, server_send_ts:double秒]
-# PING/PONG: "!id" = [frame_id:int32, ping_ts:double秒]
 _ACK_FMT = "!id"
 _ACK_SIZE = struct.calcsize(_ACK_FMT)
-_PING_FMT = "!id"
-_PING_SIZE = struct.calcsize(_PING_FMT)
 
-# ========== 6) 全局 UDP 与后台接收线程 ==========
 _GLOBAL_UDP = None
 _UDP_RX_THREAD: Optional[threading.Thread] = None
 _UDP_RX_TERMINATE = False
 
-# 最近一次 RTT（毫秒）：保留你的口径，用于参考（非逐帧）
-_RTT_MS_LAST: float = float("nan")
-_RTT_LOCK = threading.Lock()
+# === 新增：ACK/RTCP 统计（限频打印，避免 I/O 成为瓶颈）===
+_ACK_FRAME_RECV = 0       # 帧级 ACK 计数
+_ACK_PACKET_RECV = 0      # 包级 ACK 计数
+_RTCP_RECV = 0            # RTCP 报告计数
+_PONG_RECV = 0            # PONG 计数
+_PRINT_EVERY = 50         # 每收到多少个再打印一次
 
-# ========== 7) 每帧统计表 ==========
-# 结构：{fid: {t_send_start, t_send_end, bytes_total, total_ms, ping_rtt_ms, ping_prop_ms}}
 _PER_FRAME: Dict[int, Dict[str, Any]] = {}
 _PER_LOCK = threading.Lock()
 
-# ========== 8) 输出 CSV 初始化 ==========
 _CLIENT_LOG = Path("./client_times.csv")
 with _CLIENT_LOG.open("w", newline="") as f:
     w = csv.writer(f)
-    # 列顺序（精简/重排）：
-    # frame_id, bytes_total, total_ms, final_send_ms, final_prop_ms, res_elapsed_ms,
-    # ping_rtt_ms, send_ser_measured_ms, send_ser_bw_nominal_ms, send_goodput_mbps,
-    # prop_from_ack_minus_send_ms
     w.writerow([
         "frame_id","bytes_total","total_ms","final_send_ms","final_prop_ms","res_elapsed_ms",
         "ping_rtt_ms","send_ser_measured_ms","send_ser_bw_nominal_ms","send_goodput_mbps",
         "prop_from_ack_minus_send_ms"
     ])
 
-# ------------------------------------------------------------
-# 工具函数：更新/尝试落盘
-# ------------------------------------------------------------
 def _pf_update(fid: int, **kv: Any) -> None:
-    """线程安全更新某帧的统计条目。"""
     with _PER_LOCK:
         rec = _PER_FRAME.setdefault(int(fid), {})
         rec.update(kv)
 
 def _try_flush(fid: int) -> None:
-    """
-    当必需字段齐备时，计算多方法并写入 CSV，然后删除该帧条目：
-      必需：bytes_total, total_ms, t_send_start, t_send_end, t_res_recv
-      选填：ping_rtt_ms/ping_prop_ms
-    """
     with _PER_LOCK:
         rec = _PER_FRAME.get(int(fid), {})
         if not rec:
             return
-
         bytes_total = rec.get("bytes_total")
         total_ms    = rec.get("total_ms")
         t0          = rec.get("t_send_start")
         t1          = rec.get("t_send_end")
-        t_res_recv = rec.get("t_res_recv")
+        t_res_recv  = rec.get("t_res_recv")
         ping_rtt_ms = rec.get("ping_rtt_ms", None)
         ping_prop_ms= rec.get("ping_prop_ms", None)
-
-        # 仍缺少关键字段则不落盘
         if (bytes_total is None) or (total_ms is None) or (t0 is None) or (t1 is None) or (t_res_recv is None):
             return
 
-        # ===== 发送时延（多方法）=====
-        # 2.1 实测串行发送时延
+        # 发送/带宽估计
         send_ser_measured_ms = max(0.0, (float(t1) - float(t0)) * 1000.0)
-
-        # 2.2 名义带宽推导的发送时延
         send_ser_bw_nominal_ms = (int(bytes_total) * 8.0) / (NS3_DEFAULT_BITRATE_MBPS * 1e6) * 1000.0
-
-        # 2.3 实测发送窗口的有效吞吐
         dt_send = max(1e-9, float(t1) - float(t0))
         send_goodput_mbps = (int(bytes_total) * 8.0) / dt_send / 1e6
 
-        # ===== 传播时延（多方法）=====
-        prop_ping_ms = float(ping_prop_ms) if (ping_prop_ms is not None) else None
+        # 传播估计（ACK - send）
         prop_from_ack_minus_send_ms = max(0.0, float(total_ms) - float(send_ser_measured_ms))
 
-        # ===== 组合择优（残差最小）=====
+        # 组合（残差最小）
         send_candidates: List[Tuple[str, float]] = [
             ("send_measured", send_ser_measured_ms),
             ("send_bw_nominal", send_ser_bw_nominal_ms),
         ]
         prop_candidates: List[Tuple[str, float]] = [("prop_ack_minus_send", prop_from_ack_minus_send_ms)]
-        if prop_ping_ms is not None:
-            prop_candidates.append(("prop_ping_half_rtt", float(prop_ping_ms)))
+        if ping_prop_ms is not None:
+            prop_candidates.append(("prop_ping_half_rtt", float(ping_prop_ms)))
 
         best = None
         for _, s_val in send_candidates:
@@ -179,17 +120,12 @@ def _try_flush(fid: int) -> None:
                     best = (residual, float(s_val), float(p_val))
         if best is None:
             best = (0.0, float(send_ser_measured_ms), float(prop_from_ack_minus_send_ms))
-
         _, final_send_ms, final_prop_ms = best
 
-        # 计算 RES 口径的耗时（已在 RES 分支内尽力计算，这里再次兜底避免 None）
         res_elapsed_ms = rec.get("res_elapsed_ms")
         if res_elapsed_ms is None:
-            res_elapsed_ms = max(0.0, (float(t_res_recv) - float(t0)) * 1000.0)
+            res_elapsed_ms = max(0.0, (float(rec.get("t_res_recv")) - float(t0)) * 1000.0)
 
-        _, final_send_ms, final_prop_ms = best
-
-        # ===== 写 CSV =====
         with _CLIENT_LOG.open("a", newline="") as f:
             w = csv.writer(f)
             w.writerow([
@@ -205,79 +141,33 @@ def _try_flush(fid: int) -> None:
                 round(float(send_goodput_mbps), 6),
                 round(float(prop_from_ack_minus_send_ms), 3),
             ])
-
-
-        # 删除该帧条目，避免内存增长
         del _PER_FRAME[int(fid)]
 
-# ------------------------------------------------------------
-# RTT 读写（仅作近似参考）
-# ------------------------------------------------------------
-def get_last_rtt_ms() -> float:
-    """返回最近一次 ACK 或 PONG 推导的 RTT（毫秒），仅作参考。"""
-    with _RTT_LOCK:
-        return float(_RTT_MS_LAST)
-
-# ------------------------------------------------------------
-# FEC 策略：严格模式（若缺失策略实现则返回 0）
-# ------------------------------------------------------------
-def compute_webrtc_fec_rate_strict(loss_rate: float, rtt_ms: float, fps: float, bitrate_mbps: float) -> float:
-    """
-    从 WebRtcPolicy 计算 FEC，若策略不可用则返回 0.0。
-    参数:
-      - loss_rate: 丢包率（0~1）
-      - rtt_ms:    RTT 毫秒
-      - fps:       当前发送帧率
-      - bitrate_mbps: 名义码率（用于策略，若需要）
-    """
-    if WebRtcPolicy is None:
-        return 0.0
-    try:
-        return float(WebRtcPolicy.compute_fec(loss_rate, rtt_ms, fps, bitrate_mbps))
-    except Exception:
-        return 0.0
-
-# ------------------------------------------------------------
-# 本地分片（兜底）：若 ns3.sender.sendFrame 不可用，则按 MAX_PAYLOAD 直接切片
-# ------------------------------------------------------------
-def _fallback_sendFrame(frame_data: bytes, max_pay_load: int) -> List[bytes]:
-    """仅用于兜底：把 frame_data 按 max_pay_load 切片返回列表。"""
-    pkts: List[bytes] = []
-    n = len(frame_data)
-    off = 0
-    while off < n:
-        pkts.append(frame_data[off: off + max_pay_load])
-        off += max_pay_load
-    return pkts
-
-# ------------------------------------------------------------
-# 全局 UDP 初始化与后台接收线程
-# ------------------------------------------------------------
+# -------------------- UDP 入口 --------------------
 def ensure_global_udp() -> Any:
-    """
-    创建/复用全局 UDP 会话（你的 NetGearLike）：
-    - receive_mode=True：同一个 socket 用来收 ACK/RES
-    - 显式设置对端为 (UDP_DST_ADDR, UDP_DST_PORT)：用于发送
-    """
+    """创建/复用全局 UDP 会话（你的 NetGearLike 封装）。"""
     global _GLOBAL_UDP, _UDP_RX_THREAD, _UDP_RX_TERMINATE
     if _GLOBAL_UDP is not None:
         return _GLOBAL_UDP
-
     if NetGear is None:
         raise RuntimeError("未找到 unified_netgear.NetGearLike，请确认 vidgear 环境。")
 
     _GLOBAL_UDP = NetGear(
-        address=UDP_BIND_ADDR,
-        port=UDP_BIND_PORT,
+        address=UDP_DST_ADDR,
+        port=UDP_DST_PORT,
         protocol="udp",
-        receive_mode=True,   # 需要接收 ACK/PONG/RES
+        receive_mode=False,
+        local_bind_port = UDP_BIND_PORT,
         logging=True,
         mtu=DEFAULT_MTU,
         send_buffer_size=32 * 1024 * 1024,
         recv_buffer_size=32 * 1024 * 1024,
         queue_maxlen=65536,
+        slow_log_dir="./tmp/slow_logs_sender",            # 发送端日志
+        slow_weights_path="./tmp/slow_module_weights.json",
+        rtcp_interval_ms=100,
     )
-    # 显式指定对端（不同实现提供不同方式，这里做两种兼容尝试）
+    # 指定对端
     try:
         setattr(_GLOBAL_UDP, "_peer_addr", (UDP_DST_ADDR, UDP_DST_PORT))
     except Exception:
@@ -288,116 +178,284 @@ def ensure_global_udp() -> Any:
     except Exception:
         pass
 
-    # 启动后台接收线程
+    # 后台接收线程（专用、轻量、仅做分发与状态更新）
     _UDP_RX_TERMINATE = False
-    _UDP_RX_THREAD = threading.Thread(target=_ack_res_rx_loop, args=(_GLOBAL_UDP,), daemon=True)
+    _UDP_RX_THREAD = threading.Thread(target=_client_rx_loop, args=(_GLOBAL_UDP,), daemon=True)
     _UDP_RX_THREAD.start()
     return _GLOBAL_UDP
 
-# ------------------------------------------------------------
-# 后台接收线程：处理 PONG 与 ACK，并驱动 _PER_FRAME 的落盘
-# ------------------------------------------------------------
-def _ack_res_rx_loop(net: Any) -> None:
-    """后台接收线程：解析 PONG/ACK/RES。"""
-    global _RTT_MS_LAST
+def get_last_rtt_ms() -> float:
+    """返回最近 RTT（ms）：优先 median；退化用 ema。"""
+    try:
+        net = ensure_global_udp()
+        st = net.get_rtt_stats() or {}
+        v = st.get("median_ms") or st.get("ema_ms")
+        return float(v) if v is not None else float("nan")
+    except Exception:
+        return float("nan")
+
+# -------------------- RTCP 拉取（用于发送函数中取最近一条） --------------------
+def _pump_all_rtcp_and_get_latest(net: Any) -> Dict[str, Any]:
+    """抽干 RTCP 队列并返回最近一条；若无则返回空 dict。"""
+    last = None
+    while True:
+        try:
+            rep = net.get_rtcp_report()
+        except Exception:
+            rep = None
+        if rep is None:
+            break
+        last = rep
+    return {} if last is None else dict(last)
+
+# -------------------- WebRTC 策略 --------------------
+def compute_webrtc_fec_rate_strict(loss_rate: float, rtt_ms: float, fps: float, bitrate_mbps: float) -> float:
+    if WebRtcPolicy is None:
+        return 0.0
+    try:
+        return float(WebRtcPolicy.compute_fec(loss_rate, rtt_ms, fps, bitrate_mbps))
+    except Exception:
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        return 0.0
+
+# -------------------- 轻量事件处理：ACK/RTCP/RES/PONG --------------------
+def _on_ack_frame(net: Any, data: bytes) -> None:
+    """帧级 ACK：仅做轻处理与统计，禁止重 I/O。"""
+    global _ACK_FRAME_RECV
+    if len(data) < _ACK_SIZE:
+        return
+    try:
+        fid, server_send_ts = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
+        now = time.time()
+        _pf_update(int(fid), t_ack_recv=float(now))
+        rec = _PER_FRAME.get(int(fid), {})
+        t0 = rec.get("t_send_start")
+        if t0 is not None:
+            total_ms = max(0.0, (now - float(t0)) * 1000.0)
+            _pf_update(int(fid), total_ms=float(total_ms))
+        # RTT（轻量获取）
+        try:
+            st = net.get_rtt_stats() or {}
+            rtt_ms = st.get("median_ms") or st.get("ema_ms")
+            if rtt_ms is not None:
+                rtt_ms = float(rtt_ms)
+                _pf_update(int(fid), ping_rtt_ms=rtt_ms, ping_prop_ms=rtt_ms/2.0)
+        except Exception:
+            pass
+        _try_flush(int(fid))
+
+        _ACK_FRAME_RECV += 1
+        if (_ACK_FRAME_RECV % 1) == 0:
+            # 限频打印，避免 I/O 阻塞
+            print(f"[Client] ACK_FRAME received = {_ACK_FRAME_RECV}")
+    except Exception:
+        pass
+
+def _on_ack_packet(net: Any, data: bytes) -> None:
+    """包级 ACK：推进 P_ls 位图（轻量）"""
+    global _ACK_PACKET_RECV
+    if len(data) < _ACK_SIZE:
+        return
+    try:
+        packet_id, server_send_ts = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
+        try:
+            net.udp_ack_packet(int(packet_id))
+        except Exception:
+            pass
+        _ACK_PACKET_RECV += 1
+    except Exception:
+        pass
+
+def _on_res(net: Any, data: bytes) -> None:
+    """RES：按需解析（此处保持轻处理，避免 I/O）"""
+    # 你可以在此设置标志位，让业务线程去异步解析更大的 JSON/图像
+    return
+
+def _on_rtcp(net: Any) -> None:
+    """RTCP：不需要做事，netgear_udp 内部已经更新慢模块；这里只做计数。"""
+    global _RTCP_RECV
+    _RTCP_RECV += 1
+    if (_RTCP_RECV % (_PRINT_EVERY * 2)) == 0:
+        print(f"[Client] RTCP reports received = {_RTCP_RECV}")
+
+def _on_pong() -> None:
+    """PONG：仅计数"""
+    global _PONG_RECV
+    _PONG_RECV += 1
+
+# -------------------- 专用接收线程（轻量抽水） --------------------
+def _client_rx_loop(net: Any) -> None:
+    """
+    发送端的专用接收线程：持续抽干 net.recv()，避免 ACK/RTCP 堵在缓冲里。
+    - 严禁在这里做重计算/磁盘 I/O
+    - 仅做轻解析与状态更新
+    """
+    global _UDP_RX_TERMINATE
     while not _UDP_RX_TERMINATE:
         try:
             item = net.recv()
         except Exception:
             item = None
-
         if not item:
-            time.sleep(0.001)
+            # 小睡让出 GIL，避免忙等
+            time.sleep(0.0005)
             continue
 
         pkt_type = int(item.get("pkt_type", -1))
         data: bytes = item.get("data", b"")
 
-        # ---- PONG：记录 RTT 与 RTT/2 ----
-        if pkt_type == PKT_PONG:
-            try:
-                fid, ping_ts = struct.unpack(_PING_FMT, data[:_PING_SIZE])
-                now = time.time()
-                ping_rtt_ms = max(0.0, (now - float(ping_ts)) * 1000.0)
-                ping_prop_ms = ping_rtt_ms / 2.0
-                _pf_update(int(fid), ping_rtt_ms=float(ping_rtt_ms), ping_prop_ms=float(ping_prop_ms))
-                _try_flush(int(fid))
-                with _RTT_LOCK:
-                    _RTT_MS_LAST = ping_rtt_ms
-            except Exception:
-                pass
+        # 分发（保持轻处理）
+        if net.is_ack_frame(pkt_type):
+            _on_ack_frame(net, data)
             continue
 
-        # ---- ACK：每帧一次；由此计算 total_ms（ACK 到达时刻 - t_send_start）----
-        if pkt_type == PKT_ACK_FRAME:
-            if len(data) >= _ACK_SIZE:
-                try:
-                    fid, server_send_ts = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
-                    now = time.time()
-                    # 记录 ACK 到达时间；若已有 t_send_start，则可以得到 total_ms
-                    _pf_update(int(fid), t_ack_recv=float(now))
-                    rec = _PER_FRAME.get(int(fid), {})
-                    t0 = rec.get("t_send_start")
-                    if t0 is not None:
-                        total_ms = max(0.0, (now - float(t0)) * 1000.0)
-                        _pf_update(int(fid), total_ms=float(total_ms))
-                    _try_flush(int(fid))
-                except Exception:
-                    pass
-            continue
-        if pkt_type == PKT_ACK_PACKET:
-            if len(data) >= _ACK_SIZE:
-                try:
-                    fid, server_send_ts = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
-                    print(f"[ACK] {fid}")
-                    now = time.time()
-                    #TODO: 调用接口
-                    _ack_packet(int(fid))  # 来自 ns3.sender
-                    # _report_stats()
-                    # 维持最近一次 RTT（与 PING 不同口径，只作参考）
-                    with _RTT_LOCK:
-                        _RTT_MS_LAST = max(0.0, (now - float(server_send_ts)) * 1000.0)
-                except Exception:
-                    pass
+        if net.is_ack_packet(pkt_type):
+            _on_ack_packet(net, data)
             continue
 
-        # ---- 其他：RES 文本等 ----
-        if pkt_type == PKT_RES:
-            try:
-                if len(data) >= 8 and data[:4] == b'RSID':
-                    _, fid = struct.unpack('!4sI', data[:8])  # 稳定获得 frame_id
-                    now = time.time()
-                    _pf_update(int(fid), t_res_recv=float(now))
-                    # 计算 res_elapsed_ms = (t_res_recv - t_send_start) * 1000
-                    rec = _PER_FRAME.get(int(fid), {})
-                    t0 = rec.get('t_send_start')
-                    if t0 is not None:
-                        res_ms = max(0.0, (now - float(t0)) * 1000.0)
-                        _pf_update(int(fid), res_elapsed_ms=float(res_ms))
-                    # 尝试落盘（你之前的要求）
-                    _try_flush(int(fid))
+        if net.is_res(pkt_type):
+            _on_res(net, data)
+            continue
 
-                    # 【可选】剩余部分是 JSON，解析仅用于日志/调试，不影响统计稳健性
-                    try:
-                        text = data[8:].decode('utf-8', errors='ignore')
-                        # 这里不强制 json.loads，避免错误再次打断流程
-                        print(f"[Client] PKT_RES(fid={fid}) JSON(len={len(text)}): {text[:120]}...")
-                    except Exception as e:
-                        print(f"[ERROR]{e}")
-                        continue
-            except Exception as e:
-                print(f"[Client] PKT_RES parse failed (framed): {e}; len={len(data)}")
-                continue
+        if pkt_type == getattr(net, "PKT_RTCP_REPORT", -2):
+            _on_rtcp(net)
+            continue
 
-# ------------------------------------------------------------
-# 读取 CSV 第二列 size，并产生 (frame_id, size) 列表
-# ------------------------------------------------------------
+        if pkt_type == getattr(net, "PKT_PONG", -3):
+            _on_pong()
+            continue
+
+# -------------------- 核心：发送一帧（按要求修改） --------------------
+def send_file_via_netgear(frame_data: bytes, frame_id: int, fps: float, fec_policy: str) -> None:
+    """
+    修改点：
+      - loss_rate：从 RTCP 获取（抽干队列，取最近一条；若无则 0）
+      - rtt_ms   ：通过 net.get_rtt_stats()（PING/PONG 估计）
+      - 'tooth' 分支：从 net.get_slow_prediction() 取 fec_suggest
+    """
+    net = ensure_global_udp()
+
+    # —— RTCP 最近一条 —— 
+    last_rtcp = _pump_all_rtcp_and_get_latest(net)
+    if last_rtcp:
+        loss_rate = float(last_rtcp.get("lr", 0.0))
+        la = float(last_rtcp.get("la", 0.0))
+    else:
+        loss_rate = 0.0
+        la = 0.0
+
+    # —— RTT（由 PING/PONG 得到；你的 RTCP 未携带 RTT 字段）——
+    st = net.get_rtt_stats() or {}
+    rtt_ms = st.get("median_ms") or st.get("ema_ms") or 0.0
+    rtt_ms = float(rtt_ms)
+
+    # —— 选择 FEC 策略 —— 
+    if fec_policy == "no-fec":
+        fec_rate = 0.0
+
+    elif fec_policy == "webrtc":
+        fec_rate = compute_webrtc_fec_rate_strict(loss_rate=loss_rate, rtt_ms=rtt_ms,
+                                                  fps=float(fps), bitrate_mbps=NS3_DEFAULT_BITRATE_MBPS)
+
+    elif fec_policy == "hairpin":
+        ddl_ms = 100.0
+        webrtc_fec_rate = compute_webrtc_fec_rate_strict(loss_rate=loss_rate, rtt_ms=rtt_ms,
+                                                         fps=float(fps), bitrate_mbps=NS3_DEFAULT_BITRATE_MBPS)
+        fec_rate = max(0.0, min(3.0, 1.0 * (rtt_ms / max(1.0, (ddl_ms - rtt_ms))) * webrtc_fec_rate))
+
+    elif fec_policy == "tooth":
+        # === 1) 从底层 slow-module 获得 (lr_f, la_f) ===
+        slow_pred = net.get_slow_prediction()  # {'lr_f','la_f'}
+        lr_f = float(slow_pred.get("lr_f", 0.0))
+        la_f = float(slow_pred.get("la_f", 0.0))
+
+        # === 2) 计算本帧的 fl（分片数） ===
+        fl_pkts = max(1, math.ceil(len(frame_data) / MAX_PAYLOAD))
+
+        # === 3) 调用 Tooth fast-module ===
+        try:
+            # 建议把权重路径放到配置/环境，这里用默认路径
+            FAST_MODEL_PATH = "./fast_module.joblib"
+
+            # 尝试复用已加载的模型，避免反复读盘
+            _FAST = getattr(send_file_via_netgear, "_FAST_MODEL", None)
+            if _FAST is None:
+                _FAST = ToothFastModuleRF.load(FAST_MODEL_PATH)
+                setattr(send_file_via_netgear, "_FAST_MODEL", _FAST)
+
+            # 1) 主路径：使用 fast-module 预测 fec_rate
+            fec_rate = float(_FAST.predict(lr_f=lr_f, la_f=la_f, fl_pkts=fl_pkts))
+
+            # 2) 健壮性校验：若预测异常（NaN/Inf/负值），触发回退
+            if not (fec_rate == fec_rate) or fec_rate in (float("inf"), float("-inf")) or fec_rate < 0.0:
+                raise ValueError(f"fast-module predicted invalid fec={fec_rate}")
+
+            # 3) 裁剪到工程允许范围（例如 0..3 倍冗余比）
+            fec_rate = max(0.0, min(3.0, fec_rate))
+            print(f"[TOOTH] lr_f={lr_f:.4f} la_f={la_f:.3f} fl_pkts={fl_pkts} -> fec={fec_rate:.3f}")
+
+        except Exception as e:
+            # —— 回退策略：改用现有的 WebRTC 估计函数 —— 
+            # 说明：
+            #  - 仍然用 slow-module 的 lr_f 作为“下一周期丢包率”的最佳估计；
+            #  - rtt_ms/fps/bitrate_mbps 采用现有路径中的参数；
+            # print(f"[TOOTH] fast-module not ready ({e}), fallback to WebRTC mapping")
+            fec_rate = compute_webrtc_fec_rate_strict(
+                loss_rate=lr_f,                  # 用预测的下一周期丢包率 lr_f
+                rtt_ms=rtt_ms,                   # 来自 PING/PONG 的 RTT 估计
+                fps=float(fps),                  # 当前发送帧率
+                bitrate_mbps=NS3_DEFAULT_BITRATE_MBPS
+            )
+            # 保险：裁剪
+            fec_rate = max(0.0, min(3.0, float(fec_rate)))
+
+
+    else:
+        print("Error! No fec policy match!")
+        fec_rate = 0.0
+
+    # —— 分片与发送 —— 
+    if sendFrame is not None:
+        try:
+            pkts: List[bytes] = sendFrame(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms,
+                                          fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)  # type: ignore
+        except Exception as e:
+            print(f"[Send] sendFrame 失败: {e}")
+            pkts = _fallback_sendFrame(frame_data, MAX_PAYLOAD)
+    else:
+        pkts = _fallback_sendFrame(frame_data, MAX_PAYLOAD)
+
+    t0 = time.time()
+    _pf_update(int(frame_id), t_send_start=float(t0))
+
+    bytes_sum = 0
+    # === 新增：批量发送时定期让出 GIL，保证接收线程及时运行 ===
+    _yield_every = 64  # 每发送 64 个分片小让步
+    for i, raw in enumerate(pkts):
+        net.send(raw)  # 默认 DATA
+        bytes_sum += (len(raw) + APP_HEADER_BYTES)
+        if (i % _yield_every) == 0:
+            # 让出调度，避免长时间占用 GIL
+            time.sleep(0)
+
+    t1 = time.time()
+    _pf_update(int(frame_id), t_send_end=float(t1), bytes_total=int(bytes_sum))
+
+    _try_flush(int(frame_id))
+    if frame_id % 50 ==0:
+        print(f"[Sender] frame_id={frame_id} bytes={len(frame_data)} "
+          f"lr(rtpc)={loss_rate:.4f} rtt(ping)={rtt_ms:.1f} fec={fec_rate:.3f} sent_pkts={len(pkts)}")
+
+# -------------------- 其它：回放/主函数（与原版一致） --------------------
+def _fallback_sendFrame(frame_data: bytes, max_pay_load: int) -> List[bytes]:
+    pkts: List[bytes] = []
+    n = len(frame_data); off = 0
+    while off < n:
+        pkts.append(frame_data[off: off+max_pay_load])
+        off += max_pay_load
+    return pkts
+
 def _load_sizes_from_csv(csv_path: str) -> List[Tuple[int, int]]:
-    """
-    读取 metrics_serial.csv，返回 [(frame_id, size), ...]
-    - 优先用第一列 frame_idx 作为 frame_id；若第一列无法解析为整数，则回退为顺序编号。
-    - 仅提取“第二列 size”（必须为整数），其他列忽略。
-    """
     pairs: List[Tuple[int, int]] = []
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"metrics csv 不存在: {csv_path}")
@@ -406,16 +464,14 @@ def _load_sizes_from_csv(csv_path: str) -> List[Tuple[int, int]]:
         for i, row in enumerate(rdr):
             if not row:
                 continue
-            # 跳过表头（第二列不是整数时）
             try:
                 size = int(row[1])
             except Exception:
                 continue
-            # 解析 frame_id
             try:
                 fid = int(row[0])
             except Exception:
-                fid = len(pairs)  # 回退为顺序编号
+                fid = len(pairs)
             if size < 0:
                 continue
             pairs.append((fid, size))
@@ -423,138 +479,44 @@ def _load_sizes_from_csv(csv_path: str) -> List[Tuple[int, int]]:
         raise RuntimeError(f"未能在 {csv_path} 解析出任何有效的 size")
     return pairs
 
-# ------------------------------------------------------------
-# 随机生成帧负载（长度严格等于 size）
-# ------------------------------------------------------------
 def _random_payload(nbytes: int) -> bytes:
-    """
-    随机生成指定大小的字节串：
-    - 使用 os.urandom（速度快、无需额外依赖）
-    """
     return os.urandom(int(nbytes))
 
-# ------------------------------------------------------------
-# 发送一帧（含 PING、ns3 分包、本地 bytes_total 统计与时间戳维护）
-# ------------------------------------------------------------
-def send_file_via_netgear(frame_data: bytes, frame_id: int, fps: float) -> None:
-    """
-    严格版发送函数（保持你原有流程）+【新增】按帧统计：
-      - 发送前发送 PING（用于近似传播 RTT/2）
-      - 记录 t_send_start / t_send_end
-      - 统计 bytes_total（∑(len(pkt)+APP_HEADER_BYTES)）
-      - ACK/PONG 线程驱动 total_ms / ping_* 的生成
-    """
+def replay_from_metrics(csv_path: str, interval_ms: float = 30.0, fec_policy: str = "webrtc") -> None:
     net = ensure_global_udp()
-
-    # 1) 丢包率、RTT 等（若实现提供 get_stats，可拿来参考）
-    try:
-        stats = net.get_stats() or {}
-    except Exception:
-        stats = {}
-    # 丢包率估计：此处仅占位（若你在 net 中维护了更精确的口径，可替换）
-    sent_pkts = int(stats.get("sent_packets", 0))
-    recv_acks = int(stats.get("total_packets_received", 0))
-    loss_rate = 0.0
-    if sent_pkts > 0 and recv_acks >= 0:
-        # 这里的“ACK 收到包数”不是数据包数，不能直接算丢包率；仅保留接口兼容
-        loss_rate = 0.0
-    rtt_ms = get_last_rtt_ms()
-    if math.isnan(rtt_ms):
-        rtt_ms = 0.0
-
-    # 2) 计算 WebRTC 冗余率（保留口径，缺失实现则返回 0）
-    fec_rate = compute_webrtc_fec_rate_strict(
-        loss_rate=loss_rate, rtt_ms=rtt_ms, fps=float(fps), bitrate_mbps=NS3_DEFAULT_BITRATE_MBPS
-    )
-    fec_rate = 0.2
-
-    # 3) 分包：优先用 ns3.sender.sendFrame；否则使用本地兜底切片
-    if sendFrame is not None:
-        try:
-            pkts: List[bytes] = sendFrame(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms, fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)  # type: ignore
-        except Exception as e:
-            print(f"[Send] send frame 失败: {e}")
-            pkts = _fallback_sendFrame(frame_data, MAX_PAYLOAD)
-    else:
-        pkts = _fallback_sendFrame(frame_data, MAX_PAYLOAD)
-
-    # 4) 发送 PING（含 frame_id 与 ping_ts），用于近似传播时延
-    ping_ts = time.time()
-    try:
-        net.send(struct.pack(_PING_FMT, int(frame_id), float(ping_ts)), pkt_type=PKT_PING)
-    except Exception as e:
-        print(f"[Send] PING 失败: {e}")
-
-    # 5) 记录“开始发送该帧数据”的时刻（PING 不计入总时延起点）
-    t0 = time.time()
-    _pf_update(int(frame_id), t_send_start=float(t0))
-
-    # 6) 逐包发送并统计 bytes_total = ∑(len(pkt)+APP_HEADER_BYTES)
-    bytes_sum = 0
-    for raw in pkts:
-        net.send(raw)  # 实际的帧数据分片（pkt_type 走你实现的默认 DATA）
-        bytes_sum += (len(raw) + APP_HEADER_BYTES)
-
-    # 7) 记录“结束发送该帧数据”的时刻
-    t1 = time.time()
-    _pf_update(int(frame_id), t_send_end=float(t1), bytes_total=int(bytes_sum))
-
-    # 8) 尝试落盘（若 ACK/PONG 已经到达将触发写入并清理）
-    _try_flush(int(frame_id))
-
-    print(f"[Sender] frame_id={frame_id} bytes={len(frame_data)} fec={fec_rate:.4f} sent_pkts={len(pkts)}")
-
-# ------------------------------------------------------------
-# 回放：按 metrics_serial.csv 的第二列 size 逐帧发送（默认 30ms 一帧）
-# ------------------------------------------------------------
-def replay_from_metrics(csv_path: str, interval_ms: float = 30.0) -> None:
-    """
-    按 CSV 的第二列 size 回放发送：
-    - 每隔 interval_ms（默认 30ms）发送一帧
-    - 帧内容为随机字节，长度= size
-    - 帧编号使用 CSV 第一列（或顺序回退）
-    - FEC 策略求值使用 fps = 1000/interval_ms
-    """
-    ensure_global_udp()  # 初始化 UDP & 后台接收线程
     sizes = _load_sizes_from_csv(csv_path)
     fps = 1000.0 / float(interval_ms)
     next_ts = time.time()
     for (fid, size) in sizes:
         payload = _random_payload(size)
-        send_file_via_netgear(payload, frame_id=int(fid), fps=fps)
-        # 节拍控制
+        send_file_via_netgear(payload, frame_id=int(fid), fps=fps, fec_policy=fec_policy)
         next_ts += interval_ms / 1000.0
         sleep_s = next_ts - time.time()
         if sleep_s > 0:
             time.sleep(sleep_s)
         else:
-            # 赶不上节拍时，纠偏到当前时刻（避免漂移累积）
             next_ts = time.time()
 
-# ------------------------------------------------------------
-# main
-# ------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--metrics_csv", type=str, default="metrics_serial.csv",
-                        help="含有 size(第二列) 的 CSV 路径")
+                        help="含 size(第二列) 的 CSV 路径")
     parser.add_argument("--interval_ms", type=float, default=30.0,
-                        help="两帧之间的发送间隔（毫秒），默认 30ms")
+                        help="两帧间隔（毫秒）")
+    parser.add_argument("--fec_policy", type=str, default="webrtc",
+                        help="no-fec, webrtc, hairpin, tooth")
     args = parser.parse_args()
-
     try:
-        replay_from_metrics(csv_path=args.metrics_csv, interval_ms=float(args.interval_ms))
+        replay_from_metrics(csv_path=args.metrics_csv, interval_ms=float(args.interval_ms), fec_policy=args.fec_policy)
     except KeyboardInterrupt:
         pass
     finally:
-        # 等待所有帧写入完成：只有在 _PER_FRAME 为空时才退出
         while True:
             with _PER_LOCK:
                 empty = (len(_PER_FRAME) == 0)
             if empty:
                 break
             time.sleep(0.05)
-        # 可选：优雅结束后台线程
         global _UDP_RX_TERMINATE
         _UDP_RX_TERMINATE = True
         time.sleep(0.05)
