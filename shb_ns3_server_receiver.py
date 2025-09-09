@@ -23,6 +23,14 @@ from multiprocessing import Manager
 # ===== 你原有的导入（保持） =====
 from vidgear.gears.unified_netgear import NetGearLike as NetGear
 
+# ===== 绑定地址与端口 =====
+BIND_ADDR = "114.212.86.152"  # 127.0.0.1, 114.212.86.152
+PORT = 5558
+
+# ===== 回传给 client 的地址 =====
+CLIENT_ADDR = "172.27.155.100"  # "172.27.144.86" "127.0.0.1""172.27.155.100"
+CLIENT_PORT = 5559
+
 # ===== 保存目录（保持你的默认路径；首次运行清空重建） =====
 DATA_DIR = Path("/data/wxk/workspace/mirage/dataset/video000/Viduce/sender_out")
 SAVE_DIR = Path("/data/wxk/workspace/mirage/dataset/video000/Viduce/reciever_out")
@@ -31,7 +39,7 @@ if SAVE_DIR.exists():
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ===== 服务器端计时日志 =====
-SERVER_TIME_LOG = SAVE_DIR / "server_times.csv"
+SERVER_TIME_LOG = SAVE_DIR / f"server_times_{CLIENT_ADDR}.csv"
 with SERVER_TIME_LOG.open("w", newline="") as f:
     import csv as _csv
     w = _csv.writer(f)
@@ -42,14 +50,6 @@ def _server_log_row(frame_id: int, dec_ms: int, yolo_ms: int):
         import csv as _csv
         w = _csv.writer(f)
         w.writerow([int(frame_id), int(dec_ms), int(yolo_ms)])
-
-# ===== 绑定地址与端口 =====
-BIND_ADDR = "114.212.86.152"  # 127.0.0.1, 114.212.86.152
-PORT = 5558
-
-# ===== 回传给 client 的地址 =====
-CLIENT_ADDR = "172.27.155.100"  # "172.27.144.86" "127.0.0.1""172.27.155.100"
-CLIENT_PORT = 5559
 
 # ===== NS-3 收包函数（保持）=====
 try:
