@@ -36,7 +36,7 @@ from ns3.sender import sendFrame  # 分片（可选）
 
 UDP_BIND_ADDR: str = "0.0.0.0"
 UDP_BIND_PORT: int = 5559
-UDP_DST_ADDR: str = "127.0.0.1"
+UDP_DST_ADDR: str = "114.212.86.152" # 127.0.0.1
 UDP_DST_PORT: int = 5558
 
 DEFAULT_MTU: int = 1500
