@@ -5,13 +5,6 @@
 NetGearUDP —— UDP 传输 + RTCP 反馈 + Tooth slow-module（按论文）在线推理
 ----------------------------------------------------------------------
 对外仅暴露 NetGearUDP；模块内无全局变量/函数，所有状态内聚在类内。
-
-本版要点：
-  1) 集成 ToothSlowModule（来自 slow_module.py，严格按论文结构）。
-  2) 在发送端构造逐包位图 l_s（0/1，1=丢失，0=收到），并按 RTCP 窗口写 JSONL 日志。
-  3) 【MODIFIED】收到 RTCP 后不立即结算窗口，而是引入 ACK 宽限期（基于 RTT），
-     到期后再生成定长位图 P_ls，写入 JSONL，并触发慢模块前向。
-  4) __init__ 时如 slow_module_weights.json 存在，则加载权重。训练与加载均与 slow_module.py 配合。
 """
 
 import socket
@@ -27,15 +20,29 @@ import json
 import base64
 from datetime import datetime
 
-# ====== 引入严格按论文实现的 slow-module ======
+# ====== 慢模块加载（保持原逻辑，并支持动态导入） ======
 try:
-    # 你刚刚提供的 slow_module.py 中的接口
-    from vidgear.gears.tooth_slow_module import ToothSlowModule, load_weights  # type: ignore
+    # 若你的工程是包方式导入，可在同目录放 tooth_slow_module.py
+    from .tooth_slow_module import ToothSlowModule, load_weights  # type: ignore
     _SLOW_AVAILABLE = True
 except Exception:
     ToothSlowModule = None  # type: ignore
     load_weights = None     # type: ignore
     _SLOW_AVAILABLE = False
+
+import importlib.util as _imp  # MODIFIED: 动态导入兜底
+import types as _types         # MODIFIED: 动态导入兜底
+import queue                   # MODIFIED: 异步日志队列
+
+
+def _load_slow_module_dynamic(path: str):
+    """MODIFIED: 从给定文件路径动态加载 tooth_slow_module.py（或 slow_module.py）。"""
+    spec = _imp.spec_from_file_location("tooth_slow_module_dyn", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"spec_from_file_location failed for {path}")
+    mod = _imp.module_from_spec(spec)  # type: _types.ModuleType
+    spec.loader.exec_module(mod)       # type: ignore[attr-defined]
+    return mod
 
 
 class NetGearUDP:
@@ -50,18 +57,11 @@ class NetGearUDP:
       - get_rtcp_report() -> Optional[Dict[str, Any]]
       - get_rtt_stats() -> Dict[str, Any]
       - get_stats() / reset_stats() / close()
-      - udp_ack_packet(packet_id: int, ts_ms: Optional[int]=None) -> None   # 包级 ACK 入口（上层收到 PKT_ACK_PACKET 后调用）
-      - get_slow_prediction() -> Dict[str, float]    # 返回 {'lr_f','la_f'}
-      - get_network_status() -> Dict[str, Any]       # 打包当前网络状态（含慢模块最新预测）
-
-    训练/日志相关（与 slow_module.py 配合）：
-      - 初始化参数：
-          * slow_log_dir: str = "./slow_logs"                  # JSONL 日志目录
-          * slow_weights_path: str = "./slow_module_weights.json"  # 权重 JSON 路径
-          * slow_hist_n: int = 10                              # 历史窗口数 n（论文用 10）
+      - udp_ack_packet(packet_id: int, ts_ms: Optional[int]=None) -> None
+      - get_slow_prediction() -> Dict[str, float]
+      - get_network_status() -> Dict[str, Any]
     """
 
-    # ===================== 包类型常量 =====================
     DEFAULT_MTU = 1500
     RECV_QUEUE_MAXLEN = 32768
 
@@ -75,7 +75,6 @@ class NetGearUDP:
     PKT_PONG = 7
     PKT_RTCP_REPORT = 8
 
-    # ===================== 日志器 =====================
     _LOGGER = log.getLogger("NetGearUDP")
     _LOGGER.setLevel(log.DEBUG)
     if not _LOGGER.handlers:
@@ -84,7 +83,6 @@ class NetGearUDP:
         _h.setFormatter(_f)
         _LOGGER.addHandler(_h)
 
-    # ===================== 构造 =====================
     def __init__(
         self,
         address: str = "0.0.0.0",
@@ -94,14 +92,12 @@ class NetGearUDP:
         logging: bool = True,
         **options
     ) -> None:
-        # ---- 基础配置 ----
         self._logging = bool(logging)
         self._addr = address
         self._port = int(port)
         if protocol.lower() != "udp":
             raise ValueError("NetGearUDP 仅支持 protocol='udp'。")
 
-        # ---- UDP 参数 ----
         self._mtu = int(options.get("mtu", self.DEFAULT_MTU))
         self._recv_buf_size = int(options.get("recv_buffer_size", 16 * 1024 * 1024))
         self._send_buf_size = int(options.get("send_buffer_size", 16 * 1024 * 1024))
@@ -110,17 +106,16 @@ class NetGearUDP:
         self._rtcp_interval_ms = int(options.get("rtcp_interval_ms", 100))
 
         # ---- slow-module 日志与权重路径 ----
-        self._slow_log_dir: str = str(options.get("slow_log_dir", "./slow_logs"))
-        self._slow_weights_path: str = "/home/wxk/workspace/nsdi/Viduce/net/vidgear/tmp/slow_logs_sender/out.pt"
+        self._slow_log_dir: str = str(options.get("slow_log_dir", "./tmp/slow_logs_sender" if not receive_mode else "./tmp/slow_logs_receiver"))
+        self._slow_weights_path: str = str(options.get("slow_weights_path", "./tmp/slow_module_weights.json"))
         self._slow_hist_n: int = int(options.get("slow_hist_n", 10))  # 论文 n=10
 
-        # === 定长位图配置（确保数据集/在线一致）===
-        self._slow_slots_per_window: int = int(options.get("slow_slots_per_window", 32))  # 建议 20/32/64
+        # ---- 固定位图长度配置 ----
+        self._slow_slots_per_window: int = int(options.get("slow_slots_per_window", 32))
         self._slow_bytes_per_window: int = (self._slow_slots_per_window + 7) // 8
 
-        # === 【MODIFIED】ACK 宽限策略 ===
-        self._ack_grace_min_ms: int = int(options.get("ack_grace_min_ms", 50))
-        self._ack_grace_rtt_factor: float = float(options.get("ack_grace_rtt_factor", 2.0))
+        # ---- 慢模块文件路径（动态导入兜底） ----
+        self._slow_module_path: Optional[str] = options.get("slow_module_path")
 
         # 创建日志目录与本次 session 的 JSONL 文件
         try:
@@ -128,6 +123,7 @@ class NetGearUDP:
         except Exception:
             pass
         ts_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 端侧 session 文件（发送端/接收端各一份）
         self._slow_jsonl_path = os.path.join(self._slow_log_dir, f"session_{ts_name}.jsonl")
 
         # ---- 发送/接收统计 ----
@@ -140,37 +136,50 @@ class NetGearUDP:
         self._ping_seq = 0
         self._ping_pending: Dict[int, float] = {}
 
-        # RTCP（仅发送端使用）
-        self._rtcp_reports: deque = deque(maxlen=1024)   # 队列给上层拉取
-        self._last_rtcp: Optional[Dict[str, Any]] = None # 最近一条 RTCP
+        # RTCP（仅发送端使用拉取队列）
+        self._rtcp_reports: deque = deque(maxlen=1024)
+        self._last_rtcp: Optional[Dict[str, Any]] = None
 
-        # 接收端窗口内的序号缺口计数（用于接收端计算 lr/la）
+        # 接收端窗口统计（用于 lr/la 与接收端 P_ls）
         self._win_start_ts = time.time()
         self._win_rx_count = 0
         self._win_expected_count = 0
         self._last_seq_rx: Optional[int] = None
         self._rx_missing_seq_times: List[float] = []
 
-        # ====== 发送端逐包位图 l_s 所需的运行态 ======
-        # 1) 最近发送的包（(seq, ts_send)），用于按 RTCP 窗口筛选
-        self._tx_recent: deque = deque(maxlen=200000)  # type: deque[tuple[int,float]]
-        # 2) 已确认的包序号集合（收到 PKT_ACK_PACKET 后标记）
-        self._acked_seq: set = set()
-        # 3) 最近 <=10 个窗口的逐包位图，按窗口顺序存储（每项为 List[int] 的 0/1 序列）
+        # ====== 发送端：慢模块输入历史（使用对端 P_ls） ======
         self._hist_ls_bits: deque = deque(maxlen=self._slow_hist_n)
-        # 4) 历史 P_lr/P_la（长度<=10）
         self._hist_lr: deque = deque(maxlen=self._slow_hist_n)
         self._hist_la: deque = deque(maxlen=self._slow_hist_n)
-        # 5) 【MODIFIED】待结算窗口队列（收到 RTCP 后延迟到期再结算）
-        self._pending_windows: deque = deque()  # 每项: dict(win_start, win_ms, lr, la, enqueue_ts)
 
-        # ====== 慢模块（论文实现） ======
-        self._slow_pred: Dict[str, float] = {"lr_f": 0.0, "la_f": 0.0}  # 最新预测缓存
+        # ====== 发送端：包级 ACK 记录与滚动落盘（MODIFIED） ======
+        self._acked_seq: set = set()            # 仍维护，供诊断
+        self._tx_records: deque = deque()       # 每项: {"seq":int,"ts_send":float,"ts_ack":Optional[float]}
+        self._tx_index: Dict[int, Dict[str, Any]] = {}
+        self._tx_pkt_log_path = os.path.join(self._slow_log_dir, f"tx_packets_sender_{ts_name}.jsonl")
+        self._last_tx_dump_ts = time.time()
+
+        # ====== 慢模块 ======
+        self._slow_pred: Dict[str, float] = {"lr_f": 0.0, "la_f": 0.0}
+
+        global _SLOW_AVAILABLE, ToothSlowModule, load_weights
+        if (not _SLOW_AVAILABLE) and self._slow_module_path:
+            try:
+                _mod = _load_slow_module_dynamic(self._slow_module_path)
+                ToothSlowModule = getattr(_mod, "ToothSlowModule")
+                load_weights = getattr(_mod, "load_weights", None)
+                _SLOW_AVAILABLE = True
+                if self._logging:
+                    self._LOGGER.info(f"[SlowModule] Loaded from file: {self._slow_module_path}")
+            except Exception as e:
+                if self._logging:
+                    self._LOGGER.warning(f"[SlowModule] dynamic import failed: {e}")
+                _SLOW_AVAILABLE = False
+
         if _SLOW_AVAILABLE:
             try:
                 self._slow_model = ToothSlowModule()  # type: ignore
-                # 若存在权重 JSON，则加载
-                if os.path.isfile(self._slow_weights_path):
+                if os.path.isfile(self._slow_weights_path) and (load_weights is not None):
                     load_weights(self._slow_model, self._slow_weights_path)  # type: ignore
                     if self._logging:
                         self._LOGGER.info(f"[SlowModule] Loaded weights: {self._slow_weights_path}")
@@ -209,8 +218,12 @@ class NetGearUDP:
                 self._LOGGER.info(f"[UDP] Send to {self._addr}:{self._port}")
         local_bind_port = options.get("local_bind_port", None)
         if (not self._recv_mode) and local_bind_port:
-            # 发送端如强制固定源端口，则主动bind；但端口不能等于server的5558
             self._sock.bind(("0.0.0.0", int(local_bind_port)))
+
+        # ---- 异步日志线程（MODIFIED） ----
+        self._logq: "queue.SimpleQueue[Tuple[str,str]]" = queue.SimpleQueue()
+        self._log_thr = threading.Thread(target=self._log_sink_loop, name="UDP-LOG", daemon=True)
+        self._log_thr.start()
 
         # ---- I/O 与 RTCP 线程 ----
         self._rx_thread = threading.Thread(target=self._io_loop, name="UDP-RX", daemon=True)
@@ -224,14 +237,6 @@ class NetGearUDP:
     def _now_ms() -> int:
         return int(time.time() * 1000)
 
-    # 【MODIFIED】动态计算 ACK 宽限（毫秒）
-    def _current_ack_grace_ms(self) -> float:
-        rtt = None if self._rtt_ema_ms is None else float(self._rtt_ema_ms)
-        base = float(self._ack_grace_min_ms)
-        if rtt is None:
-            return base
-        return max(base, float(self._ack_grace_rtt_factor) * rtt)
-
     # ===================== 类型判断（供上层使用） =====================
     def is_ack_frame(self, pkt_type: int) -> bool:
         return int(pkt_type) == self.PKT_ACK_FRAME
@@ -242,26 +247,28 @@ class NetGearUDP:
     def is_res(self, pkt_type: int) -> bool:
         return int(pkt_type) == self.PKT_RES
 
-    # ===================== 包级 ACK 入口（上层在收到 PKT_ACK_PACKET 后调用） =====================
+    # ===================== 包级 ACK 入口（上层收到 PKT_ACK_PACKET 后调用） =====================
     def udp_ack_packet(self, packet_id: int, ts_ms: Optional[int] = None) -> None:
         """
-        标记一个已确认的包序号，用于构造逐包位图 l_s（0=收到，1=丢失）。
-        参数：
-          - packet_id: DATA 包的序号（与 send 时写入的 seq 对齐）
-          - ts_ms: 可选，ACK 到达时间（目前不需要）
+        标记一个已确认的包序号（发送端诊断用）；同时更新滚动 tx 记录（MODIFIED）。
         """
         try:
             self._acked_seq.add(int(packet_id))
         except Exception:
             pass
+        # MODIFIED: 更新滚动记录的 ts_ack
+        try:
+            rec = self._tx_index.get(int(packet_id))
+            if rec is not None and rec.get("ts_ack") is None:
+                rec["ts_ack"] = float(time.time()) if ts_ms is None else (float(ts_ms)/1000.0)
+        except Exception:
+            pass
 
     # ===================== 慢模块预测/网络状态查询 =====================
     def get_slow_prediction(self) -> Dict[str, float]:
-        """返回最近一次 online 推理的 slow 预测结果：{'lr_f','la_f'}。"""
         return dict(self._slow_pred)
 
     def get_network_status(self) -> Dict[str, Any]:
-        """打包当前网络状态（供调试/上层查看）。"""
         return {
             "rtcp": (None if self._last_rtcp is None else dict(self._last_rtcp)),
             "rtt": self.get_rtt_stats(),
@@ -277,7 +284,6 @@ class NetGearUDP:
     def send(self, frame: Union[bytes, bytearray, memoryview], pkt_type: int = None) -> None:
         """
         发送一个逻辑包；若启用 seq 头，则对 DATA/RES/SV_DATA/ACK_PACKET 写入 4B 序号。
-        新增：发送 DATA 时，记录 (seq, ts_send) 到 _tx_recent 供 l_s 构造使用。
         """
         if frame is None:
             return
@@ -298,7 +304,6 @@ class NetGearUDP:
         out = bytearray()
         out.append(int(pkt_type) & 0xFF)
 
-        # 分配/写入序号
         seq_for_log: Optional[int] = None
         if self._enable_seq and pkt_type in (self.PKT_DATA, self.PKT_RES, self.PKT_SV_DATA, self.PKT_ACK_PACKET):
             if not hasattr(self, "_seq_tx"):
@@ -316,13 +321,15 @@ class NetGearUDP:
                 raise RuntimeError("Receiver has no known peer address to send to yet.")
             self._sent_packets += 1
 
-            # 记录 DATA 包的 (seq, ts_send) 以备 l_s 构造
+            # MODIFIED: 发送端滚动记录DATA包（仅发送端 && DATA）
             if (not self._recv_mode) and (pkt_type == self.PKT_DATA) and (seq_for_log is not None):
-                self._tx_recent.append((seq_for_log, time.time()))
-                # 适度清理陈旧发送记录（保留近 60 秒）
-                cutoff = time.time() - 60.0
-                while self._tx_recent and self._tx_recent[0][1] < cutoff:
-                    self._tx_recent.popleft()
+                now = time.time()
+                rec = {"seq": int(seq_for_log), "ts_send": float(now), "ts_ack": None}
+                self._tx_records.append(rec)
+                self._tx_index[int(seq_for_log)] = rec
+                # 控制极端增长（非常规兜底）：超过 200k 也做一次瘦身
+                if len(self._tx_records) > 200000:
+                    self._dump_old_tx_records(force=True)
 
         except Exception as e:
             if self._logging:
@@ -371,6 +378,14 @@ class NetGearUDP:
         try:
             if hasattr(self, "_rx_thread") and self._rx_thread.is_alive():
                 self._rx_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_log_thr") and self._log_thr.is_alive():
+                # 给日志线程一点时间刷盘
+                time.sleep(0.1)
+        except Exception:
+            pass
         finally:
             try:
                 self._sock.close()
@@ -384,9 +399,9 @@ class NetGearUDP:
             try:
                 ready = select.select([self._sock], [], [], 0.05)
                 if not ready[0]:
-                    # 【MODIFIED】即便无包可收，也尝试在发送端结算到期窗口
+                    # 空闲时机：发送端执行滚动落盘（MODIFIED）
                     if not self._recv_mode:
-                        self._finalize_pending_windows()
+                        self._dump_old_tx_records()
                     continue
 
                 pkt, peer = self._sock.recvfrom(65535)
@@ -411,11 +426,18 @@ class NetGearUDP:
 
                 body = pkt[offset:]
 
-                # 包级 ACK 数量（统计用途）
+                # === 控制面包的内部处理（不上抛） ===
                 if pkt_type == self.PKT_ACK_PACKET:
                     self._total_packets_received += 1
+                    # MODIFIED: 自动解析 data_seq 并登记 ACK（避免依赖上层）
+                    try:
+                        if len(body) >= 4:
+                            data_seq = struct.unpack(">I", body[:4])[0]  # 按 ACK 格式调整
+                            self.udp_ack_packet(int(data_seq))
+                    except Exception:
+                        pass
+                    continue  # MODIFIED: 不上抛
 
-                # PING→PONG（RTT）
                 if pkt_type == self.PKT_PING:
                     if self._recv_mode and self._peer_addr:
                         out = bytes([self.PKT_PONG]) + body
@@ -424,7 +446,7 @@ class NetGearUDP:
                         except Exception as e:
                             if self._logging:
                                 self._LOGGER.warning(f"send PONG error: {e}")
-                    continue
+                    continue  # MODIFIED: 不上抛
 
                 if pkt_type == self.PKT_PONG:
                     now = time.time()
@@ -437,38 +459,53 @@ class NetGearUDP:
                         else:
                             self._rtt_ema_ms = 0.8 * self._rtt_ema_ms + 0.2 * rtt_ms
                         self._ping_pending.pop(pseq, None)
-                    continue
+                    continue  # MODIFIED: 不上抛
 
-                # RTCP 报告：发送端入队【延迟结算】
-                if pkt_type == self.PKT_RTCP_REPORT:
-                    if not self._recv_mode:
+                if pkt_type == self.PKT_RTCP_REPORT and not self._recv_mode:
+                    if len(body) >= 28:
                         try:
-                            if len(body) >= 28:
-                                win_start_ts, lr, la, rx_pkts, win_ms, last_seq = struct.unpack(">dffffI", body[:28])
-                                rep = {
-                                    "win_start_ts": float(win_start_ts),  # seconds
-                                    "lr": float(lr),
-                                    "la": float(la),
-                                    "rx_pkts": int(rx_pkts),
-                                    "win_ms": float(win_ms),
-                                    "last_seq_rx": int(last_seq),
-                                }
-                                self._last_rtcp = rep
-                                if len(self._rtcp_reports) < self._rtcp_reports.maxlen:
-                                    self._rtcp_reports.append(rep)
+                            win_start_ts, lr, la, rx_pkts, win_ms, last_seq = struct.unpack(">dffffI", body[:28])
+                            rep = {
+                                "win_start_ts": float(win_start_ts),
+                                "lr": float(lr),
+                                "la": float(la),
+                                "rx_pkts": int(rx_pkts),
+                                "win_ms": float(win_ms),
+                                "last_seq_rx": int(last_seq),
+                            }
+                            self._last_rtcp = rep
+                            if len(self._rtcp_reports) < self._rtcp_reports.maxlen:
+                                self._rtcp_reports.append(rep)
 
-                                # 【MODIFIED】仅入队，等宽限期后再结算
-                                self._enqueue_pending_window(rep)
+                            bits = None
+                            if len(body) > 28:
+                                blen = body[28]
+                                bmap = body[29:29+blen]
+                                if len(bmap) == blen:
+                                    S = blen * 8
+                                    bits = []
+                                    for j in range(S):
+                                        byte = bmap[j // 8]
+                                        bits.append((byte >> (j % 8)) & 1)  # LSB-first
 
-                                # 机会性结算（避免只在定时器里结算）
-                                self._finalize_pending_windows()
-
+                            if bits is not None:
+                                # 用接收端位图推进历史 & 写发送端 JSONL & 触发慢模块
+                                self._hist_ls_bits.append(bits)
+                                self._hist_lr.append(float(lr))
+                                self._hist_la.append(float(la))
+                                self._write_jsonl_sample(float(win_start_ts), float(lr), float(la),
+                                                         float(win_ms), bits_override=bits)  # 发送端日志
+                                self._run_slow_forward()
+                            else:
+                                # 未携带位图（兼容老对端）：此处可选择跳过或进入旧的 pending 流程
+                                pass
                         except Exception as e:
                             if self._logging:
                                 self._LOGGER.warning(f"parse RTCP report error: {e}")
-                    continue
+                    continue  # MODIFIED: 不上抛
 
-                # 接收端：统计窗口内按序号缺口（用于计算 lr/la）
+                # === 以下是数据面包（会上抛） ===
+                # 接收端：统计窗口内按序号缺口（用于计算 lr/la 与构建接收端 P_ls）
                 if self._recv_mode and self._enable_seq and (pkt_type in (self.PKT_DATA, self.PKT_RES, self.PKT_SV_DATA)):
                     now = time.time()
                     self._win_rx_count += 1
@@ -483,20 +520,17 @@ class NetGearUDP:
                             else:
                                 self._win_expected_count += gap
                                 if gap > 1:
+                                    # 记录缺口时间（gap-1 次）
                                     self._rx_missing_seq_times.extend([now] * (gap - 1))
                             self._last_seq_rx = seq
 
-                # 入队给上层
+                # 入队给上层（仅非控制包）
                 if len(self._queue) < self._queue_maxlen:
                     self._queue.append({
                         "pkt_type": int(pkt_type),
                         "data": body,
                         "seq": None if seq is None else int(seq),
                     })
-
-                # 【MODIFIED】每次 I/O 后也尝试结算到期窗口
-                if not self._recv_mode:
-                    self._finalize_pending_windows()
 
             except socket.error as e:
                 err = getattr(e, "errno", None)
@@ -515,8 +549,7 @@ class NetGearUDP:
         - 发送端：定期发 PING，基于 PONG 估计 RTT（毫秒）
         - 接收端：每 rtcp_interval_ms 汇总一次窗口，发送 RTCP_REPORT：
             body: [win_start_ts(double, seconds), lr(float), la(float), rx_pkts(float), win_ms(float), last_seq_rx(u32)]
-          la 的计算仍照你之前的近似实现。
-        - 【MODIFIED】发送端：周期性尝试结算到期窗口（补偿 I/O 循环可能的空档）
+            + [bitmap_len(1B)] + [bitmap_bytes]
         """
         ping_interval = max(2 * self._rtcp_interval_ms, 100) / 1000.0
         last_ping_ts = time.time()
@@ -537,7 +570,7 @@ class NetGearUDP:
                     if self._logging:
                         self._LOGGER.debug(f"send PING error: {e}")
 
-            # 接收端：汇总 RTCP
+            # 接收端：汇总 RTCP（MODIFIED: 附带接收端位图，并在发送时写接收端 JSONL）
             if self._recv_mode and (now - self._win_start_ts) * 1000.0 >= self._rtcp_interval_ms:
                 rx = self._win_rx_count
                 expected = max(self._win_expected_count, rx)
@@ -553,12 +586,22 @@ class NetGearUDP:
 
                 win_ms = (now - self._win_start_ts) * 1000.0
 
+                # MODIFIED: 计算接收端位图
+                S = int(self._slow_slots_per_window)
+                bits = self._build_rx_pls_bits(self._win_start_ts, win_ms, S)
+                bmap_bytes = bytearray((S + 7) // 8)
+                for i, b in enumerate(bits):
+                    if b:
+                        bmap_bytes[i // 8] |= (1 << (i % 8))
+
                 if self._peer_addr:
                     body = struct.pack(">dffffI",
                                        float(self._win_start_ts),
                                        float(lr), float(la),
                                        float(rx), float(win_ms),
                                        int(self._last_seq_rx or 0))
+                    # 附带位图（长度 + 字节）
+                    body += struct.pack("B", len(bmap_bytes)) + bytes(bmap_bytes)
                     out = bytes([self.PKT_RTCP_REPORT]) + body
                     try:
                         self._sock.sendto(out, self._peer_addr)
@@ -566,138 +609,59 @@ class NetGearUDP:
                         if self._logging:
                             self._LOGGER.debug(f"send RTCP report error: {e}")
 
+                    # 接收端：发送 RTCP 时写一行 JSONL（接收端日志）
+                    self._write_jsonl_sample(
+                        win_start_sec=float(self._win_start_ts),
+                        lr=float(lr),
+                        la=float(la),
+                        win_ms=float(win_ms),
+                        bits_override=bits,
+                        out_path_override=self._slow_jsonl_path,  # 接收端自己的 session 文件
+                    )
+
                 # 窗口复位
                 self._win_start_ts = now
                 self._win_rx_count = 0
                 self._win_expected_count = 0
                 self._rx_missing_seq_times.clear()
 
-            # 【MODIFIED】发送端：周期性尝试结算到期窗口
+            # 发送端：周期性滚动落盘（MODIFIED）
             if not self._recv_mode:
-                self._finalize_pending_windows()
+                self._dump_old_tx_records()
 
             time.sleep(0.01)
 
-    # ===================== 内部：延迟结算窗口 / 构造 l_s / 写日志 / 调慢模块 =====================
-
-    # 【MODIFIED】入队一个待结算窗口（收到 RTCP 后调用）
-    def _enqueue_pending_window(self, rep: Dict[str, Any]) -> None:
-        try:
-            item = dict(rep)
-            item["enqueue_ts"] = time.time()
-            self._pending_windows.append(item)
-        except Exception as e:
-            if self._logging:
-                self._LOGGER.debug(f"_enqueue_pending_window error: {e}")
-
-    # 【MODIFIED】结算到期窗口：满足 window_end + grace_ms 的窗口按规则生成定长位图并写日志/触发前向
-    def _finalize_pending_windows(self) -> None:
-        if not self._pending_windows:
-            return
-        try:
-            now = time.time()
-            grace_ms = self._current_ack_grace_ms()
-            changed = False
-            while self._pending_windows:
-                it = self._pending_windows[0]
-                win_start = float(it["win_start_ts"])
-                win_ms = float(it["win_ms"])
-                win_end = win_start + win_ms / 1000.0
-                # 到期条件：当前时间 >= 窗口结束 + grace
-                if now < (win_end + grace_ms / 1000.0):
-                    break
-
-                # 出队并结算
-                self._pending_windows.popleft()
-                lr = float(it["lr"]); la = float(it["la"])
-                # 1) 生成定长位图（使用“超时仍未 ACK 才置 1”的规则）
-                bits = self._build_ls_bits_with_grace(win_start, win_ms, grace_ms)
-                # 2) 进历史
-                self._hist_ls_bits.append(bits)
-                self._hist_lr.append(lr)
-                self._hist_la.append(la)
-                # 3) 写 JSONL
-                self._write_jsonl_sample(win_start, lr, la, win_ms, bits_override=bits)
-                # 4) 在线前向
-                self._run_slow_forward()
-                changed = True
-
-            # 如果有结算动作，顺便清理 _tx_recent 更旧的记录
-            if changed:
-                cutoff = now - 60.0
-                while self._tx_recent and self._tx_recent[0][1] < cutoff:
-                    self._tx_recent.popleft()
-        except Exception as e:
-            if self._logging:
-                self._LOGGER.debug(f"_finalize_pending_windows error: {e}")
-
-    # 【MODIFIED】带 ACK 宽限期的位图生成（定长、1=丢，0=未丢/未发送）
-    def _build_ls_bits_with_grace(self, win_start_sec: float, win_ms: float, grace_ms: float) -> List[int]:
-        try:
-            S = int(self._slow_slots_per_window)
-            win_start = float(win_start_sec)
-            win_end = win_start + float(win_ms) / 1000.0
-            slot_ms = float(win_ms) / max(1, S)
-            finalize_ts = win_end + float(grace_ms) / 1000.0  # 结算时刻
-
-            seen_loss = [False] * S  # 仅需记录“该 slot 是否发生过未 ACK 的发送”
-            # 遍历窗口内发送的 DATA 包
-            for (seq, ts_send) in list(self._tx_recent):
-                if ts_send < win_start or ts_send >= win_end:
-                    continue
-                # 若到“结算时刻”仍未 ACK，则认为该包丢失，置位到对应 slot
-                if int(seq) not in self._acked_seq:
-                    # 仍未 ACK 且包龄 >= grace → 计为丢
-                    if (finalize_ts - ts_send) >= 0:
-                        rel_ms = (ts_send - win_start) * 1000.0
-                        idx = int(rel_ms // slot_ms) if slot_ms > 0 else 0
-                        if idx < 0:
-                            idx = 0
-                        elif idx >= S:
-                            idx = S - 1
-                        seen_loss[idx] = True
-
-            # 生成定长位图：1=该 slot 发生过“超时未 ACK”的发送；0=未丢或未发送
-            return [1 if seen_loss[i] else 0 for i in range(S)]
-
-        except Exception as e:
-            if self._logging:
-                self._LOGGER.debug(f"_build_ls_bits_with_grace error: {e}")
-            return [0] * int(self._slow_slots_per_window)
-
-    # （保留原无宽限版本以备调试，但不在生产路径使用）
-    def _build_and_push_ls_for_window(self, win_start_sec: float, win_ms: float) -> None:
-        try:
-            S = int(self._slow_slots_per_window)
-            win_start = float(win_start_sec)
-            win_end = win_start + float(win_ms) / 1000.0
-            slot_ms = float(win_ms) / max(1, S)
-
-            seen_loss = [False] * S
-            for (seq, ts) in list(self._tx_recent):
-                if ts < win_start or ts >= win_end:
-                    continue
-                rel_ms = (ts - win_start) * 1000.0
-                idx = int(rel_ms // slot_ms) if slot_ms > 0 else 0
-                if idx < 0:
-                    idx = 0
-                elif idx >= S:
-                    idx = S - 1
-                if int(seq) not in self._acked_seq:
-                    seen_loss[idx] = True
-
-            l_s_bits = [1 if seen_loss[i] else 0 for i in range(S)]
-            self._hist_ls_bits.append(l_s_bits)
-
-        except Exception as e:
-            if self._logging:
-                self._LOGGER.debug(f"_build_and_push_ls_for_window error: {e}")
-
-    # 【MODIFIED】写 JSONL：允许传入 bits_override（用于延迟结算后的结果）
-    def _write_jsonl_sample(self, win_start_sec: float, lr: float, la: float, win_ms: float,
-                            bits_override: Optional[List[int]] = None) -> None:
+    # ===================== 接收端位图构造（MODIFIED） =====================
+    def _build_rx_pls_bits(self, win_start_sec: float, win_ms: float, S: int) -> List[int]:
         """
-        写单窗口 JSONL：
+        接收端 P_ls：用窗口内“缺失序号”的时间戳集合 -> slot 索引置 1。
+        1 表示该时间段内出现了缺口（成团丢/极迟到）；0 表示未丢或无发送。
+        """
+        S = max(1, int(S))
+        bits = [0] * S
+        if win_ms <= 0:
+            return bits
+        slot_ms = float(win_ms) / float(S)
+        win_start = float(win_start_sec)
+        win_end = win_start + float(win_ms) / 1000.0
+        for t in self._rx_missing_seq_times:
+            if t < win_start or t >= win_end:
+                continue
+            rel_ms = (t - win_start) * 1000.0
+            idx = int(rel_ms // slot_ms)
+            if idx < 0:
+                idx = 0
+            elif idx >= S:
+                idx = S - 1
+            bits[idx] = 1
+        return bits
+
+    # ===================== JSONL 写入（异步入队） =====================
+    def _write_jsonl_sample(self, win_start_sec: float, lr: float, la: float, win_ms: float,
+                            bits_override: Optional[List[int]] = None,
+                            out_path_override: Optional[str] = None) -> None:
+        """
+        写单窗口 JSONL（异步）：
         - pls_bits_b64 固定长度：bytes_len = ceil(S/8)
         - 采用 LSB-first 打包：slot0 -> 第0位的 LSB，以此类推
         - pls_slot_ms = window_ms / S（固定）
@@ -709,16 +673,12 @@ class NetGearUDP:
             if bits_override is not None:
                 bits = list(bits_override)
             else:
-                # 若历史为空则补 0 窗口
                 bits = self._hist_ls_bits[-1] if self._hist_ls_bits else [0] * S
 
-            # ---- 固定字节数打包（LSB-first）----
-            by = bytearray(B)  # 预分配固定长度，默认全 0
+            by = bytearray(B)
             for i, bit in enumerate(bits):
                 if bit:
-                    byte_idx = i // 8
-                    bit_off = i % 8          # LSB-first
-                    by[byte_idx] |= (1 << bit_off)
+                    by[i // 8] |= (1 << (i % 8))
 
             b64 = base64.b64encode(bytes(by)).decode("ascii")
 
@@ -728,36 +688,78 @@ class NetGearUDP:
                 "la": float(la),
                 "pls_bits_b64": b64,
                 "window_ms": float(win_ms),
-                "pls_slot_ms": float(win_ms) / max(1, S),    # 固定
+                "pls_slot_ms": float(win_ms) / max(1, S),
             }
-            with open(self._slow_jsonl_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            path = out_path_override or self._slow_jsonl_path
+            line = json.dumps(rec, ensure_ascii=False) + "\n"
+            # MODIFIED: 异步入队，后台批量写盘
+            self._logq.put((path, line))
         except Exception as e:
             if self._logging:
                 self._LOGGER.debug(f"_write_jsonl_sample error: {e}")
 
+    # ===================== 异步日志落盘线程（MODIFIED） =====================
+    def _log_sink_loop(self) -> None:
+        """
+        将 (path, line) 从队列中取出，按文件聚合批量写入。
+        """
+        buffers: Dict[str, List[str]] = {}
+        last_flush = time.time()
+        FLUSH_LINES = 200
+        FLUSH_SEC = 0.2
+        while not self._terminate:
+            try:
+                path, line = self._logq.get(timeout=0.05)
+                buf = buffers.setdefault(path, [])
+                buf.append(line)
+            except Exception:
+                pass
+            now = time.time()
+            if (now - last_flush) >= FLUSH_SEC:
+                for path, buf in list(buffers.items()):
+                    if not buf:
+                        continue
+                    try:
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write("".join(buf))
+                    except Exception:
+                        pass
+                    buffers[path].clear()
+                last_flush = now
+            else:
+                # 若某个文件的缓存积累到阈值，也立即刷新
+                for path, buf in list(buffers.items()):
+                    if len(buf) >= FLUSH_LINES:
+                        try:
+                            os.makedirs(os.path.dirname(path), exist_ok=True)
+                            with open(path, "a", encoding="utf-8") as f:
+                                f.write("".join(buf))
+                        except Exception:
+                            pass
+                        buffers[path].clear()
+
+    # ===================== 慢模块在线前向 =====================
     def _run_slow_forward(self) -> None:
         """
-        将最近 n=self._slow_hist_n 个窗口的定长位图按时间顺序拼接（不足 n 个则在左侧用“全 0 窗口”填充），
+        将最近 n=self._slow_hist_n 个窗口的定长位图按时间顺序拼接（不足 n 个则左侧补 0），
         联合 P_lr/P_la 历史，完成一次慢模块前向。
         """
         if self._slow_model is None:
             return
         try:
-            import torch
+            import torch  # 本地 CPU 前向足够
             n = int(self._slow_hist_n)
             S = int(self._slow_slots_per_window)
 
-            # 取最近窗口的位图
             wins = list(self._hist_ls_bits)[-n:]
             if len(wins) < n:
-                pad = [[0]*S for _ in range(n - len(wins))]  # 左侧 0 窗口
+                pad = [[0]*S for _ in range(n - len(wins))]
                 wins = pad + wins
 
-            # 拼接为固定长度向量（n*S）
             concat_bits: List[int] = []
             for w in wins:
-                concat_bits.extend(w)  # 每 w 都已是长度 S
+                concat_bits.extend(w)
 
             P_lr = list(self._hist_lr)[-n:]
             P_la = list(self._hist_la)[-n:]
@@ -767,10 +769,64 @@ class NetGearUDP:
                 P_la = [0.0]*(n - len(P_la)) + P_la
 
             with torch.no_grad():
-                y = self._slow_model(P_lr=P_lr, P_la=P_la, l_s_bits=concat_bits)  # 固定长度输入
+                y = self._slow_model(P_lr=P_lr, P_la=P_la, l_s_bits=concat_bits)  # type: ignore
             lr_f = float(y[0].item())
             la_f = float(y[1].item())
             self._slow_pred = {"lr_f": lr_f, "la_f": la_f}
         except Exception as e:
             if self._logging:
                 self._LOGGER.debug(f"_run_slow_forward error: {e}")
+
+    # ===================== 发送端包级 ACK 记录滚动落盘（MODIFIED） =====================
+    def _dump_old_tx_records(self, force: bool = False) -> None:
+        """
+        每 10 秒处理“10 秒前”的记录；策略：
+        - 10s：仅写出“已 ACK”的记录；
+        - 20s：强制写出（即便仍未 ACK）；
+        所有落盘通过异步日志队列，避免热路径 IO。
+        """
+        try:
+            now = time.time()
+            if (not force) and ((now - self._last_tx_dump_ts) < 10.0):
+                return
+            self._last_tx_dump_ts = now
+            cutoff_dump = now - 10.0   # <= 10s 前 -> 若已 ACK 则写
+            cutoff_force = now - 20.0  # <= 20s 前 -> 强制写（未 ACK 也写）
+
+            out_lines = []
+            while self._tx_records:
+                rec = self._tx_records[0]
+                ts_send = float(rec.get("ts_send", now))
+                if ts_send <= cutoff_force:
+                    # 强制写（即便未 ACK）
+                    self._tx_records.popleft()
+                    self._tx_index.pop(int(rec.get("seq", -1)), None)
+                    line = {
+                        "seq": int(rec.get("seq", -1)),
+                        "ts_send_ms": int(round(ts_send * 1000.0)),
+                        "ts_ack_ms": (None if rec.get("ts_ack") is None else int(round(float(rec["ts_ack"]) * 1000.0)))
+                    }
+                    out_lines.append(json.dumps(line, ensure_ascii=False) + "\n")
+                elif ts_send <= cutoff_dump:
+                    # 只写已 ACK 的，未 ACK 继续等待
+                    if rec.get("ts_ack") is not None:
+                        self._tx_records.popleft()
+                        self._tx_index.pop(int(rec.get("seq", -1)), None)
+                        line = {
+                            "seq": int(rec.get("seq", -1)),
+                            "ts_send_ms": int(round(ts_send * 1000.0)),
+                            "ts_ack_ms": int(round(float(rec["ts_ack"]) * 1000.0)),
+                        }
+                        out_lines.append(json.dumps(line, ensure_ascii=False) + "\n")
+                    else:
+                        break
+                else:
+                    break  # 后面的都是更近的，保留
+
+            # 异步写盘
+            for s in out_lines:
+                self._logq.put((self._tx_pkt_log_path, s))
+
+        except Exception as e:
+            if self._logging:
+                self._LOGGER.debug(f"_dump_old_tx_records error: {e}")
