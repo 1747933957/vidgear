@@ -32,11 +32,11 @@ try:
 except Exception:
     WebRtcPolicy = None  # type: ignore
 
-from ns3.sender import sendFrame  # 分片（可选）
+from ns3.sender import sendFrame, sendFrame_xor  # 分片（可选）
 
 UDP_BIND_ADDR: str = "0.0.0.0"
 UDP_BIND_PORT: int = 5559
-UDP_DST_ADDR: str = "114.212.86.152" # 127.0.0.1
+UDP_DST_ADDR: str = "127.0.0.1"
 UDP_DST_PORT: int = 5558
 
 DEFAULT_MTU: int = 1500
@@ -53,9 +53,6 @@ _UDP_RX_TERMINATE = False
 
 # === 新增：ACK/RTCP 统计（限频打印，避免 I/O 成为瓶颈）===
 _ACK_FRAME_RECV = 0       # 帧级 ACK 计数
-_ACK_PACKET_RECV = 0      # 包级 ACK 计数
-_RTCP_RECV = 0            # RTCP 报告计数
-_PONG_RECV = 0            # PONG 计数
 _PRINT_EVERY = 50         # 每收到多少个再打印一次
 
 _PER_FRAME: Dict[int, Dict[str, Any]] = {}
@@ -163,7 +160,7 @@ def ensure_global_udp() -> Any:
         send_buffer_size=32 * 1024 * 1024,
         recv_buffer_size=32 * 1024 * 1024,
         queue_maxlen=65536,
-        slow_log_dir="./tmp/slow_logs_sender",            # 发送端日志
+        slow_log_dir="./tmp/logs_sender",            # 发送端日志
         slow_weights_path="./tmp/slow_module_weights.json",
         rtcp_interval_ms=100,
     )
@@ -245,24 +242,9 @@ def _on_ack_frame(net: Any, data: bytes) -> None:
         _try_flush(int(fid))
 
         _ACK_FRAME_RECV += 1
-        if (_ACK_FRAME_RECV % 1) == 0:
+        if (_ACK_FRAME_RECV % 10) == 0:
             # 限频打印，避免 I/O 阻塞
             print(f"[Client] ACK_FRAME received = {_ACK_FRAME_RECV}")
-    except Exception:
-        pass
-
-def _on_ack_packet(net: Any, data: bytes) -> None:
-    """包级 ACK：推进 P_ls 位图（轻量）"""
-    global _ACK_PACKET_RECV
-    if len(data) < _ACK_SIZE:
-        return
-    try:
-        packet_id, server_send_ts = struct.unpack(_ACK_FMT, data[:_ACK_SIZE])
-        try:
-            net.udp_ack_packet(int(packet_id))
-        except Exception:
-            pass
-        _ACK_PACKET_RECV += 1
     except Exception:
         pass
 
@@ -271,17 +253,6 @@ def _on_res(net: Any, data: bytes) -> None:
     # 你可以在此设置标志位，让业务线程去异步解析更大的 JSON/图像
     return
 
-def _on_rtcp(net: Any) -> None:
-    """RTCP：不需要做事，netgear_udp 内部已经更新慢模块；这里只做计数。"""
-    global _RTCP_RECV
-    _RTCP_RECV += 1
-    if (_RTCP_RECV % (_PRINT_EVERY * 2)) == 0:
-        print(f"[Client] RTCP reports received = {_RTCP_RECV}")
-
-def _on_pong() -> None:
-    """PONG：仅计数"""
-    global _PONG_RECV
-    _PONG_RECV += 1
 
 # -------------------- 专用接收线程（轻量抽水） --------------------
 def _client_rx_loop(net: Any) -> None:
@@ -309,20 +280,8 @@ def _client_rx_loop(net: Any) -> None:
             _on_ack_frame(net, data)
             continue
 
-        if net.is_ack_packet(pkt_type):
-            _on_ack_packet(net, data)
-            continue
-
         if net.is_res(pkt_type):
             _on_res(net, data)
-            continue
-
-        if pkt_type == getattr(net, "PKT_RTCP_REPORT", -2):
-            _on_rtcp(net)
-            continue
-
-        if pkt_type == getattr(net, "PKT_PONG", -3):
-            _on_pong()
             continue
 
 # -------------------- 核心：发送一帧（按要求修改） --------------------
@@ -408,22 +367,20 @@ def send_file_via_netgear(frame_data: bytes, frame_id: int, fps: float, fec_poli
             )
             # 保险：裁剪
             fec_rate = max(0.0, min(3.0, float(fec_rate)))
-
-
+    elif fec_policy == "viduce":
+        fec_rate = compute_webrtc_fec_rate_strict(loss_rate=loss_rate, rtt_ms=rtt_ms,
+                                                  fps=float(fps), bitrate_mbps=NS3_DEFAULT_BITRATE_MBPS)
     else:
         print("Error! No fec policy match!")
         fec_rate = 0.0
 
     # —— 分片与发送 —— 
-    if sendFrame is not None:
-        try:
-            pkts: List[bytes] = sendFrame(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms,
-                                          fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)  # type: ignore
-        except Exception as e:
-            print(f"[Send] sendFrame 失败: {e}")
-            pkts = _fallback_sendFrame(frame_data, MAX_PAYLOAD)
+    if fec_policy == "viduce":
+        pkts: List[bytes] = sendFrame_xor(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms,
+                                          fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)
     else:
-        pkts = _fallback_sendFrame(frame_data, MAX_PAYLOAD)
+        pkts: List[bytes] = sendFrame(frame_data, loss_rate=loss_rate, rtt_ms=rtt_ms,
+                                        fec_rate=fec_rate, max_pay_load=MAX_PAYLOAD)
 
     t0 = time.time()
     _pf_update(int(frame_id), t_send_start=float(t0))
@@ -504,7 +461,7 @@ def main() -> None:
     parser.add_argument("--interval_ms", type=float, default=30.0,
                         help="两帧间隔（毫秒）")
     parser.add_argument("--fec_policy", type=str, default="webrtc",
-                        help="no-fec, webrtc, hairpin, tooth")
+                        help="no-fec, webrtc, hairpin, tooth, viduce")
     args = parser.parse_args()
     try:
         replay_from_metrics(csv_path=args.metrics_csv, interval_ms=float(args.interval_ms), fec_policy=args.fec_policy)
