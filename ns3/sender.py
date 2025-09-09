@@ -210,10 +210,87 @@ def sendFrame(data: bytes, loss_rate: float, rtt_ms: int, fec_rate: float, max_p
     data_size = len(data)
     payload_cap = max_pay_load
 
+    # 1) 计算 data 分片数量
+    n = data_size // payload_cap + int(data_size % payload_cap != 0)
+    if n == 0:
+        n = 1  # 保证至少 1 片（允许空帧）
+
+    # 2) 令牌桶进账：当 fec_rate * n 存在小数时，存入 deposit = MIN(max_payload, data_size)
+    real_fec_num = fec_rate * float(n)
+    frac = abs(real_fec_num - math.floor(real_fec_num))
+    if frac > 1e-9:
+        deposit = min(payload_cap, data_size)
+        g_token_bucket_bytes += deposit
+
+    # 3) 计算本轮 XOR 预算/分摊（用当前桶额度）
+    xor_info = _compute_append_info(g_token_bucket_bytes)
+    xor_budget_to_send = xor_info.xor_bytes
+
+    # 4) 令牌桶出账（与本轮实际发送一致）
+    if xor_budget_to_send > 0:
+        use = min(xor_budget_to_send, g_token_bucket_bytes)
+        g_token_bucket_bytes -= use
+
+    # 5) 生成 Data 分片
+    fid = _next_frame_id()
+    m_frame_body_bytes[fid] = data_size
+    chunks: List[bytes] = [data[i:i+payload_cap] for i in range(0, data_size, payload_cap)]
+    if not chunks:
+        chunks = [b""]
+    n = len(chunks)
+
+    data_pkts: List[bytes] = []
+    for i, payload in enumerate(chunks):
+        pid = _next_packet_id()
+        dp = DataPacket(packet_id=pid, frame_id=fid, frame_len=data_size, frame_pkt_num=n, pkt_id_in_frame=i, payload=payload)
+        data_pkts.append(dp.to_bytes())
+
+    # 6) 生成 FEC（摘要 XOR，不做真实纠删）
+    fec_num = int(math.floor(n * fec_rate))
+    fec_pkts: List[bytes] = []
+    if fec_num > 0:
+        max_len = max((len(c) for c in chunks), default=0)
+        def xor_many(bufs):
+            if not bufs:
+                return b""
+            padded = [b + b"\x00"*(max_len-len(b)) for b in bufs]
+            out = bytearray(padded[0])
+            for b in padded[1:]:
+                for i in range(max_len):
+                    out[i] ^= b[i]
+            return bytes(out)
+        parity = xor_many(chunks)
+        cover_ids = list(range(n))
+        for _ in range(fec_num):
+            pid = _next_packet_id()
+            fp = FecPacket(packet_id=pid, frame_id=fid, covered_ids=cover_ids, parity=parity)
+            fec_pkts.append(fp.to_bytes())
+
+    return data_pkts + fec_pkts
+
+def sendFrame_xor(data: bytes, loss_rate: float, rtt_ms: float, fec_rate: float, max_pay_load: int) -> List[bytes]:
+    """
+    输入一帧原始 bytes，输出需要“上线传输”的 bytes 包列表（Data/FEC/XOR）。
+    - Data：按 max_pay_load 切片（至少一片）
+    - FEC ：floor(n * fec_rate) 个摘要包（不做真实纠删）
+    - XOR ：严格按“水库 + 令牌桶”策略决定是否在本帧内发送一个 XOR 包（预算 τ）
+    """
+    assert max_pay_load > 0
+    global g_token_bucket_bytes
+
+    data_size = len(data)
+    payload_cap = max_pay_load
+
     # === 在线模型预测（保持原有调用） ===
     # pred_loss, pred_dur = predict_next_by_slow_module()
     # print(pred_loss, pred_dur)
-    L_cur = 5  # 这里保持现状；若要接入 pred_dur，可解注释并做限幅
+    # L_cur是现在的ddl/rtt和1/冗余率上取整的最小值
+    ddl = 100.0
+    if fec_rate <= 0.000001:
+        fec_rate = 0.000001
+    if rtt_ms <= 0.000001:
+        rtt_ms = 30.0
+    L_cur = math.ceil(min(ddl/rtt_ms, 1/fec_rate))
 
     # 1) 计算 data 分片数量
     n = data_size // payload_cap + int(data_size % payload_cap != 0)
@@ -271,8 +348,8 @@ def sendFrame(data: bytes, loss_rate: float, rtt_ms: int, fec_rate: float, max_p
             fp = FecPacket(packet_id=pid, frame_id=fid, covered_ids=cover_ids, parity=parity)
             fec_pkts.append(fp.to_bytes())
             
-    # # 9) 当前帧入队水库（从下一帧开始参与）
-    # _enqueue_token_plan(fid, min(payload_cap, data_size), L_cur)
+    # 9) 当前帧入队水库（从下一帧开始参与）
+    _enqueue_token_plan(fid, min(payload_cap, data_size), L_cur)
 
     # 7) 生成 XOR 包（anchor=当前帧；合并所有源）
     xor_pkts: List[bytes] = []
@@ -302,8 +379,7 @@ def sendFrame(data: bytes, loss_rate: float, rtt_ms: int, fec_rate: float, max_p
         tail = b'\xff' * int(budget)   # 末尾追加长度为 budget 的全 1 payload（仅用于“占位带宽”，方便对齐 NS-3）
         xor_pkts.append(raw + tail)
 
-    # # 8) 提交本轮（推进水库）
-    # _commit_after_send()
+    # 8) 提交本轮（推进水库）
+    _commit_after_send()
 
-    return data_pkts + fec_pkts
-    # return data_pkts + fec_pkts + xor_pkts
+    return data_pkts + fec_pkts + xor_pkts
