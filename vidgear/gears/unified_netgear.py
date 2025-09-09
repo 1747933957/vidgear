@@ -26,7 +26,7 @@ import importlib
 
 # 相对导入：同目录中的两种实现
 from .netgear_udp import NetGearUDP
-from .netgear_webrtc import NetGearWebRTC
+# from .netgear_webrtc import NetGearWebRTC
 
 
 class NetGearLike:
@@ -39,9 +39,9 @@ class NetGearLike:
             if proto == "udp":
                 # UDP 走 NetGearUDP（与你现有逻辑保持一致）
                 return NetGearUDP(*args, **kwargs)
-            if proto == "webrtc":
-                # WebRTC 走我们新增的 NetGearWebRTC
-                return NetGearWebRTC(*args, **kwargs)
+            # if proto == "webrtc":
+            #     # WebRTC 走我们新增的 NetGearWebRTC
+            #     return NetGearWebRTC(*args, **kwargs)
 
         # 其他协议：回落到原生 NetGear（ZeroMQ）
         vidgear_netgear = importlib.import_module("vidgear.gears.netgear")

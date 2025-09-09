@@ -44,11 +44,11 @@ def _server_log_row(frame_id: int, dec_ms: int, yolo_ms: int):
         w.writerow([int(frame_id), int(dec_ms), int(yolo_ms)])
 
 # ===== 绑定地址与端口 =====
-BIND_ADDR = "127.0.0.1"  # 127.0.0.1, 114.212.86.152
+BIND_ADDR = "114.212.86.152"  # 127.0.0.1, 114.212.86.152
 PORT = 5558
 
 # ===== 回传给 client 的地址 =====
-CLIENT_ADDR = "127.0.0.1"  # "172.27.144.86" "127.0.0.1""172.27.128.241"
+CLIENT_ADDR = "172.27.155.100"  # "172.27.144.86" "127.0.0.1""172.27.155.100"
 CLIENT_PORT = 5559
 
 # ===== NS-3 收包函数（保持）=====
